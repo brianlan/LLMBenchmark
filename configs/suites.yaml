@@ -1,18 +1,22 @@
 # Benchmark suites run through EvalScope.
 #
 # profiles:
-#   smoke = connectivity check (few samples), lite = quick comparable slice,
-#   full  = whole dataset unless `full_max_samples` caps it.
+#   smoke = connectivity check, lite = quick comparable slice, full = whole dataset
+#   unless `full_per_subset_limit` caps it (EvalScope's limit applies per subset).
 # Dataset spec fields:
-#   core               run by default (core: false needs --include-extensions)
-#   full_max_samples   cap used only by the `full` profile
-#   pinned             always limit=1 (used with a local, pre-filtered dataset)
-#   local_path         local dataset dir; ${DATA_ROOT} expands to --data-root
-#   dataset_args       passed through to EvalScope dataset_args[<dataset>]
-#   extra_params       merged into dataset_args[<dataset>].extra_params
-#   generation_config  merged over the model generation config for this dataset
-#   eval_batch_size    per-dataset override
-#   sandbox            per-dataset override of the suite sandbox config
+#   core                    run by default (core: false needs --include-extensions)
+#   full_per_subset_limit   per-subset cap used only by the `full` profile
+#   pinned                  always limit=1 (used with a local, pre-filtered dataset)
+#   local_path              local dataset dir; ${DATA_ROOT} expands to --data-root
+#   dataset_args            passed through to EvalScope dataset_args[<dataset>]
+#   extra_params            merged into dataset_args[<dataset>].extra_params
+#   generation_config       merged over the model generation config for this dataset
+#   agent_config            EvalScope NativeAgentConfig (mode/max_steps/command_timeout)
+#   eval_batch_size         per-dataset override
+#   sandbox                 per-dataset override of the suite sandbox config
+#   requires_sandbox        true = code executes in a sandbox; no host fallback
+#   requires                importable modules checked during preflight
+#   status                  tested | configured (not yet executed) | requires-extra-deps
 
 profiles:
   smoke: {limit: 5}
@@ -25,11 +29,11 @@ defaults:
 suites:
   knowledge:
     datasets:
-      gpqa_diamond: {core: true}
-      math_500:     {core: true}
-      ifeval:       {core: true}
-      mmlu_pro:         {core: false, full_max_samples: 500}
-      zebralogicbench:  {core: false, full_max_samples: 200}
+      gpqa_diamond: {core: true, status: tested}
+      math_500:     {core: true, status: tested}
+      ifeval:       {core: true, status: tested, requires: [langdetect]}
+      mmlu_pro:         {core: false, full_per_subset_limit: 500, status: configured}
+      zebralogicbench:  {core: false, full_per_subset_limit: 200, status: configured}
 
   swe:
     # One container per sample; never run these in parallel batches on this host.
@@ -38,15 +42,19 @@ suites:
     datasets:
       swe_bench_verified:
         core: true
-        full_max_samples: 50
+        status: tested
+        full_per_subset_limit: 50
+        requires: [swebench]
+        requires_sandbox: true
         dataset_args:
           inference_dataset_id: princeton-nlp/SWE-bench_oracle
       swe_bench_verified_agentic:
         core: true
         pinned: true
+        status: tested
+        requires: [swebench, ms_enclave]
+        requires_sandbox: true
         local_path: ${DATA_ROOT}/pinned/swe_bench_verified_django1
-        # EvalScope 1.12 agent budget lives in agent_config; the adapter keeps
-        # strategy=swe_bench_toolcall / max_steps=250 defaults when omitted.
         agent_config:
           mode: native
           max_steps: 250
@@ -60,25 +68,27 @@ suites:
           stream: true
       live_code_bench:
         core: true
+        status: tested
         # 28 subsets x limit items; execute in parallel instead of one by one.
         eval_batch_size: 4
-        full_max_samples: 100
-      swe_bench_pro:            {core: false}
-      terminal_bench_v2_1:      {core: false}
-      swe_bench_lite_agentic:   {core: false}
-      bigcodebench:             {core: false}
+        full_per_subset_limit: 100
+        requires_sandbox: true
+      swe_bench_pro:            {core: false, status: configured, requires: [ms_enclave], requires_sandbox: true}
+      terminal_bench_v2_1:      {core: false, status: requires-extra-deps, requires: [harbor], requires_sandbox: true}
+      swe_bench_lite_agentic:   {core: false, status: configured, requires: [swebench, ms_enclave], requires_sandbox: true}
+      bigcodebench:             {core: false, status: configured, requires_sandbox: true}
 
   vision:
     datasets:
-      ocr_bench_v2: {core: true, full_max_samples: 1000}
-      docvqa:       {core: true, full_max_samples: 1000}
-      math_vista:   {core: true}
-      ocr_bench:            {core: false}
-      cc_ocr_v2:            {core: false, full_max_samples: 500}
-      mmmu:                 {core: false}
-      mmmu_pro:             {core: false, full_max_samples: 500}
-      vstar_bench:          {core: false}
-      chartqa:              {core: false}
-      omni_doc_bench_v1_6:  {core: false}
-      olmocr_bench:         {core: false}
-      maritime_ocr_bench:   {core: false}
+      ocr_bench_v2: {core: true, status: tested, full_per_subset_limit: 1000, requires: [apted, distance, Levenshtein, lxml, Polygon, zss, jieba, nltk, editdistance]}
+      docvqa:       {core: true, status: tested, full_per_subset_limit: 1000}
+      math_vista:   {core: true, status: tested}
+      ocr_bench:            {core: false, status: configured, requires: [apted, distance, Levenshtein, lxml, Polygon, zss, jieba, nltk, editdistance]}
+      cc_ocr_v2:            {core: false, status: configured, full_per_subset_limit: 500}
+      mmmu:                 {core: false, status: configured}
+      mmmu_pro:             {core: false, status: configured, full_per_subset_limit: 500}
+      vstar_bench:          {core: false, status: configured}
+      chartqa:              {core: false, status: configured, requires_extras: judge}
+      omni_doc_bench_v1_6:  {core: false, status: requires-extra-deps, requires_sandbox: true}
+      olmocr_bench:         {core: false, status: requires-extra-deps, requires: [rapidfuzz, fuzzysearch]}
+      maritime_ocr_bench:   {core: false, status: requires-extra-deps}
