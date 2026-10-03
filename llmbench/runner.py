@@ -1,0 +1,551 @@
+"""Run orchestration: attempt lifecycle, error boundaries, persistence and re-import."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import __version__ as TOOL_VERSION
+from .compat import apply_ocr_compat, report_patch_status
+from .config import ConfigError, model_config_identity, protocol_identity
+from .evidence import (
+    MetricParseError,
+    ReportError,
+    apply_coverage,
+    build_sample_manifest,
+    capture_loaded_dataset,
+    collect_output_evidence,
+    locate_report,
+    metric_rows,
+    summarize_diagnostics,
+    write_run_manifest,
+)
+from .store import DuplicateAttemptError, Store
+from .util import (
+    atomic_write_json,
+    collect_secrets,
+    digest,
+    now_iso,
+    read_json,
+    redact,
+    redact_text,
+    safe_slug,
+)
+from .validation import (
+    COMPARABILITY_UNKNOWN,
+    VALID,
+    assess_comparability,
+    assess_run,
+)
+
+
+class BatchInterrupted(RuntimeError):
+    pass
+
+
+@dataclass
+class AttemptResult:
+    run_id: str
+    output_dir: Path
+    execution_status: str
+    validity_status: str
+    status_reason: str
+    persisted: bool
+    error: str | None = None
+
+    @property
+    def acceptable(self) -> bool:
+        return self.execution_status == 'completed' and self.validity_status == VALID
+
+
+def batch_exit_code(results, *, allow_partial: bool = False) -> int:
+    """Exit code 0 only when every selected attempt met the agreed success contract."""
+    accepted = {'complete', 'partial'} if allow_partial else {'complete'}
+    if not results:
+        return 1
+    clean = all(
+        result.persisted and result.execution_status == 'completed'
+        and result.validity_status in accepted
+        for result in results
+    )
+    return 0 if clean else 1
+
+
+def new_attempt_id() -> str:
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def git_commit(repo_dir: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ['git', '-C', str(repo_dir), 'rev-parse', '--short', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return ''
+
+
+def evalscope_version() -> str:
+    try:
+        import evalscope
+        return getattr(evalscope, '__version__', 'unknown')
+    except Exception:
+        return 'unknown'
+
+
+def resolve_task_config(raw_cfg: dict) -> dict:
+    """Resolve EvalScope defaults once; used for protocol identity and the manifest."""
+    from evalscope.config import TaskConfig
+    return TaskConfig.from_dict(raw_cfg).model_dump(mode='json')
+
+
+def build_raw_task_config(entry, *, data_root: Path, output_dir: Path, api_key: str) -> dict:
+    model_cfg = entry.model_cfg
+    generation_config = {}
+    for source in (model_cfg.get('generation_config'), entry.spec.get('generation_config')):
+        for key, value in (source or {}).items():
+            generation_config[key] = value
+    task_cfg = {
+        'model': model_cfg['model_id'],
+        'model_id': model_cfg.get('report_id') or model_cfg['model_id'],
+        'api_url': model_cfg['api_url'],
+        'api_key': api_key,
+        'eval_type': model_cfg.get('eval_type', 'openai_api'),
+        'datasets': [entry.dataset],
+        'dataset_dir': str(data_root / 'datasets'),
+        'generation_config': generation_config,
+        'limit': entry.limit,
+        'eval_batch_size': entry.batch_size,
+        'work_dir': str(output_dir),
+        'no_timestamp': True,
+        'seed': 42,
+        'collect_perf': True,
+        'ignore_errors': True,
+    }
+    dataset_args = dict(entry.spec.get('dataset_args') or {})
+    if entry.local_path is not None:
+        dataset_args['local_path'] = str(entry.local_path)
+    if entry.spec.get('extra_params'):
+        dataset_args['extra_params'] = {
+            **(dataset_args.get('extra_params') or {}), **entry.spec['extra_params']
+        }
+    if dataset_args:
+        task_cfg['dataset_args'] = {entry.dataset: dataset_args}
+    if entry.spec.get('agent_config'):
+        task_cfg['agent_config'] = dict(entry.spec['agent_config'])
+    sandbox = entry.spec.get('sandbox') or {}
+    if sandbox:
+        task_cfg['sandbox'] = dict(sandbox)
+    return task_cfg
+
+
+def build_run_manifest(entry, *, attempt_id: str, run_group: str, output_dir: Path,
+                       raw_cfg: dict, resolved_cfg: dict, repo_dir: Path,
+                       data_root: Path) -> dict:
+    secrets = collect_secrets(raw_cfg)
+    return {
+        'tool': 'llmbench',
+        'tool_version': TOOL_VERSION,
+        'created_at': now_iso(),
+        'attempt_id': attempt_id,
+        'run_group': run_group,
+        'suite': entry.suite,
+        'profile': entry.profile,
+        'dataset': entry.dataset,
+        'model_alias': entry.model_alias,
+        'model_id': entry.model_cfg['model_id'],
+        'report_id': raw_cfg.get('model_id'),
+        'api_url': redact(entry.model_cfg.get('api_url', ''), secrets),
+        'model_config_identity': model_config_identity(entry.model_alias, entry.model_cfg),
+        'protocol_identity': protocol_identity(resolved_cfg),
+        'dataset_source': dataset_source(entry, data_root),
+        'limits': {
+            'profile': entry.profile,
+            'per_subset': entry.limit,
+            'cli_override': None,
+        },
+        'generation_config': redact(resolved_cfg.get('generation_config') or {}, secrets),
+        'agent_config': redact(resolved_cfg.get('agent_config') or {}, secrets),
+        'sandbox': redact(resolved_cfg.get('sandbox') or {}, secrets),
+        'task_config': redact(raw_cfg, secrets),
+        'dataset_status': entry.status,
+        'git_commit': git_commit(repo_dir),
+        'evalscope_version': evalscope_version(),
+        'output_dir': str(output_dir),
+        'sample_manifest': [],
+        'sample_manifest_detail': {},
+        'sample_manifest_identity': None,
+    }
+
+
+def dataset_source(entry, data_root: Path) -> dict:
+    source = {
+        'dataset_id': entry.spec.get('dataset_args', {}).get('inference_dataset_id'),
+        'local_path': str(entry.local_path) if entry.local_path else None,
+        'pinned': entry.pinned,
+        'revision': 'unknown',
+    }
+    if entry.local_path is not None:
+        source_file = entry.local_path / 'source.json'
+        if source_file.exists():
+            try:
+                pinned_source = read_json(source_file)
+            except Exception:
+                pinned_source = {}
+            source['revision'] = pinned_source.get('revision', 'unknown')
+            source['pinned_source'] = pinned_source
+    if not source['dataset_id']:
+        try:
+            from evalscope.api.registry import BENCHMARK_REGISTRY
+            meta = BENCHMARK_REGISTRY.get(entry.dataset)
+            source['dataset_id'] = getattr(meta, 'dataset_id', None)
+        except Exception:
+            source['dataset_id'] = None
+    return source
+
+
+def _attempt_record(entry, *, attempt_id, run_group, output_dir, raw_cfg, manifest, repo_dir) -> dict:
+    secrets = collect_secrets(raw_cfg)
+    return {
+        'run_id': attempt_id,
+        'run_group': run_group,
+        'model_alias': entry.model_alias,
+        'model_id': entry.model_cfg['model_id'],
+        'api_url': redact(entry.model_cfg.get('api_url', ''), secrets),
+        'model_config_identity': manifest['model_config_identity'],
+        'suite': entry.suite,
+        'profile': entry.profile,
+        'dataset': entry.dataset,
+        'execution_status': 'running',
+        'validity_status': None,
+        'status_reason': None,
+        'phase': 'preflight',
+        'comparability': COMPARABILITY_UNKNOWN,
+        'started_at': now_iso(),
+        'evalscope_version': evalscope_version(),
+        'tool_version': TOOL_VERSION,
+        'git_commit': git_commit(repo_dir),
+        'output_dir': str(output_dir),
+        'config_json': json.dumps(redact(raw_cfg, secrets), ensure_ascii=False, sort_keys=True),
+        'protocol_identity': manifest['protocol_identity'],
+        'sample_manifest_identity': None,
+    }
+
+
+def _manifest_rows_from_details(detail: dict) -> list[dict]:
+    rows = []
+    for subset, samples in (detail or {}).items():
+        rows.append({
+            'subset': subset,
+            'selected': len(samples),
+            'sample_ids': [item['id'] for item in samples],
+            'question_digest': digest([item['question_digest'] for item in samples]),
+            'media_digest': digest([item['media_digest'] for item in samples]),
+            'input_digest': digest([item['input_digest'] for item in samples]),
+            'media_evidence': all(item.get('media_evidence', True) for item in samples),
+        })
+    return rows
+
+
+def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, output_dir: Path,
+                    raw_cfg: dict, resolved_cfg: dict, repo_dir: Path, data_root: Path) -> AttemptResult:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = build_run_manifest(
+        entry, attempt_id=attempt_id, run_group=run_group, output_dir=output_dir,
+        raw_cfg=raw_cfg, resolved_cfg=resolved_cfg, repo_dir=repo_dir, data_root=data_root,
+    )
+    try:
+        store.start_attempt(_attempt_record(entry, attempt_id=attempt_id, run_group=run_group,
+                                            output_dir=output_dir, raw_cfg=raw_cfg,
+                                            manifest=manifest, repo_dir=repo_dir))
+    except DuplicateAttemptError:
+        return AttemptResult(attempt_id, output_dir, 'failed', 'invalid',
+                             'duplicate attempt id', persisted=False)
+    write_run_manifest(output_dir, redact(manifest, collect_secrets(raw_cfg)))
+
+    phase = 'inference'
+    task_error = None
+    interrupted = False
+    compat_status = apply_ocr_compat()
+    report_patch_status(compat_status)
+
+    def on_samples(raw_dataset, processed_dataset):
+        rows, details = build_sample_manifest(raw_dataset, processed_dataset)
+        manifest['sample_manifest'] = rows
+        manifest['sample_manifest_detail'] = details
+        manifest['sample_manifest_identity'] = digest(rows) if rows else None
+        write_run_manifest(output_dir, redact(manifest, collect_secrets(raw_cfg)))
+
+    extra_diagnostics = {'ocr_compat': compat_status}
+    try:
+        with capture_loaded_dataset(on_samples):
+            from evalscope import run_task
+            run_task(raw_cfg)
+    except KeyboardInterrupt:
+        interrupted = True
+    except Exception:
+        task_error = traceback.format_exc()
+
+    report = None
+    report_error = None
+    metrics = []
+    phase = 'report'
+    if not interrupted and task_error is None:
+        try:
+            report_path, report = locate_report(
+                output_dir, entry.dataset, raw_cfg.get('model_id'),
+                expected_pretty_name=_pretty_name(entry.dataset),
+            )
+            manifest['report_path'] = str(report_path)
+            metrics = metric_rows(report)
+        except ReportError as exc:
+            report_error = exc
+        except MetricParseError as exc:
+            report_error = ReportError('metric_parse_error', str(exc))
+        except Exception as exc:  # noqa: BLE001 - keep the batch alive, record phase
+            report_error = ReportError('parse_error', f'{exc.__class__.__name__}: {exc}')
+
+    output_evidence = {'subsets': {}, 'malformed_lines': []}
+    phase = 'diagnostics'
+    try:
+        output_evidence = collect_output_evidence(output_dir, entry.dataset)
+    except Exception as exc:  # noqa: BLE001
+        extra_diagnostics['diagnostics_error'] = f'{exc.__class__.__name__}: {exc}'
+
+    manifest_rows = manifest.get('sample_manifest') or []
+    coverage_rows = apply_coverage(manifest_rows, output_evidence)
+    manifest_identity = manifest.get('sample_manifest_identity')
+    outcome = assess_run(
+        interrupted=interrupted, task_error=task_error, report_error=report_error,
+        metrics=metrics, execution_summary=(report or {}).get('execution_summary'),
+        manifest_rows=coverage_rows,
+    )
+    comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
+    if comparability_reasons and outcome['validity_status'] == VALID and comparability != 'verified':
+        outcome['status_reason'] = (outcome['status_reason'] + '; ' if outcome['status_reason'] else '') \
+            + 'comparability: ' + '; '.join(comparability_reasons)
+
+    diagnostics = summarize_diagnostics(output_evidence)
+    diagnostics.update(extra_diagnostics)
+    diagnostics['comparability_reasons'] = comparability_reasons
+    diagnostics['raw_output_dir'] = str(output_dir)
+
+    if report is not None:
+        diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
+        execution = report.get('execution_summary') or {}
+    else:
+        execution = {}
+
+    outcome.update({
+        'phase': 'persist',
+        'finished_at': now_iso(),
+        'comparability': comparability,
+        'num_requested': execution.get('requested'),
+        'num_succeeded': execution.get('succeeded'),
+        'num_errored': execution.get('errored'),
+        'incomplete': bool(execution.get('incomplete')),
+        'report_path': manifest.get('report_path'),
+        'metrics': metrics,
+        'sample_manifest': coverage_rows,
+        'diagnostics': diagnostics,
+        'perf_metrics': (report or {}).get('perf_metrics'),
+        'primary_metric_identity': (report or {}).get('primary_metric_identity'),
+        'protocol_identity': manifest.get('protocol_identity'),
+        'sample_manifest_identity': manifest_identity,
+        'error': redact_text(task_error or '', collect_secrets(raw_cfg)) or None,
+    })
+    outcome_file = output_dir / 'run_outcome.json'
+    atomic_write_json(outcome_file, redact({**outcome, 'diagnostics': diagnostics}, collect_secrets(raw_cfg)))
+
+    persisted = True
+    persist_error = None
+    phase = 'persist'
+    try:
+        store.finish_attempt(attempt_id, outcome)
+    except Exception as exc:  # noqa: BLE001
+        persisted = False
+        persist_error = f'{exc.__class__.__name__}: {exc}'
+        print(f'!!! failed to persist {attempt_id}: {persist_error}\n'
+              f'    evidence kept at {output_dir}; re-import with: bench.py import --output-dir {output_dir}',
+              file=sys.stderr)
+
+    if interrupted:
+        raise BatchInterrupted()
+    result = AttemptResult(
+        run_id=attempt_id, output_dir=output_dir,
+        execution_status=outcome['execution_status'], validity_status=outcome['validity_status'],
+        status_reason=outcome['status_reason'], persisted=persisted,
+        error=outcome.get('error') or persist_error,
+    )
+    print(f"--- {entry.dataset} [{attempt_id}] {result.execution_status}/{result.validity_status}"
+          f" ({result.status_reason})")
+    if persisted and metrics:
+        top = [row for row in metrics if row['is_primary']] or [row for row in metrics if not row['category']]
+        for row in top[:3]:
+            score = 'N/A' if row['score'] is None else f"{row['score']:.4f}"
+            print(f"    {row['metric_name']} = {score} (n={row['num']})")
+    return result
+
+
+def _pretty_name(dataset: str):
+    try:
+        from evalscope.api.registry import BENCHMARK_REGISTRY
+        meta = BENCHMARK_REGISTRY.get(dataset)
+        return getattr(meta, 'pretty_name', None)
+    except Exception:
+        return None
+
+
+def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: Path) -> dict:
+    """Re-parse an existing output directory without calling any model."""
+    output_dir = Path(output_dir)
+    manifest = read_json(output_dir / 'run_manifest.json') if (output_dir / 'run_manifest.json').exists() else None
+    if manifest is None:
+        raise ConfigError(f'no run_manifest.json under {output_dir}')
+    entry = _ManifestEntry(manifest)
+    run_id = manifest['attempt_id']
+
+    report_path, report = locate_report(
+        output_dir, manifest['dataset'], manifest['report_id'], expected_pretty_name=None
+    )
+    metrics = metric_rows(report)
+    output_evidence = collect_output_evidence(output_dir, manifest['dataset'])
+    raw_rows = manifest.get('sample_manifest') or _manifest_rows_from_details(
+        manifest.get('sample_manifest_detail') or {}
+    )
+    coverage_rows = apply_coverage(raw_rows, output_evidence)
+    manifest_identity = manifest.get('sample_manifest_identity') or (digest(raw_rows) if raw_rows else None)
+    outcome = assess_run(
+        report_error=None, metrics=metrics,
+        execution_summary=report.get('execution_summary'), manifest_rows=coverage_rows,
+    )
+    comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
+    diagnostics = summarize_diagnostics(output_evidence)
+    diagnostics['comparability_reasons'] = comparability_reasons
+    diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
+    diagnostics['imported'] = True
+    outcome.update({
+        'phase': 'imported', 'finished_at': now_iso(), 'comparability': comparability,
+        'num_requested': (report.get('execution_summary') or {}).get('requested'),
+        'num_succeeded': (report.get('execution_summary') or {}).get('succeeded'),
+        'num_errored': (report.get('execution_summary') or {}).get('errored'),
+        'incomplete': bool((report.get('execution_summary') or {}).get('incomplete')),
+        'report_path': str(report_path), 'metrics': metrics, 'sample_manifest': coverage_rows,
+        'diagnostics': diagnostics, 'perf_metrics': report.get('perf_metrics'),
+        'primary_metric_identity': report.get('primary_metric_identity'),
+        'protocol_identity': manifest.get('protocol_identity'),
+        'sample_manifest_identity': manifest_identity,
+    })
+    if not store.attempt_exists(run_id):
+        store.start_attempt(_manifest_attempt_record(entry, manifest, output_dir, repo_dir))
+    store.finish_attempt(run_id, outcome)
+    atomic_write_json(output_dir / 'run_outcome.json', redact(outcome))
+    return {'run_id': run_id, 'validity_status': outcome['validity_status'],
+            'metrics': len(metrics), 'comparability': comparability}
+
+
+class _ManifestEntry:
+    """Minimal entry view for re-import and image ownership checks."""
+
+    def __init__(self, manifest: dict):
+        self.model_alias = manifest.get('model_alias')
+        self.model_cfg = {
+            'model_id': manifest.get('model_id'),
+            'api_url': manifest.get('api_url'),
+            'report_id': manifest.get('report_id'),
+        }
+        self.suite = manifest.get('suite')
+        self.dataset = manifest.get('dataset')
+        self.profile = manifest.get('profile')
+        self.spec = {}
+        self.limit = (manifest.get('limits') or {}).get('per_subset')
+        self.batch_size = 1
+        self.pinned = False
+        self.local_path = None
+        self.requires = ()
+        self.status = 'imported'
+
+
+def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: Path) -> dict:
+    return {
+        'run_id': manifest['attempt_id'], 'run_group': manifest.get('run_group'),
+        'model_alias': entry.model_alias, 'model_id': entry.model_cfg['model_id'],
+        'api_url': entry.model_cfg.get('api_url'),
+        'model_config_identity': manifest.get('model_config_identity'),
+        'suite': entry.suite, 'profile': entry.profile, 'dataset': entry.dataset,
+        'execution_status': 'running', 'validity_status': None, 'status_reason': 'imported',
+        'phase': 'imported', 'comparability': COMPARABILITY_UNKNOWN,
+        'started_at': manifest.get('created_at') or now_iso(),
+        'evalscope_version': manifest.get('evalscope_version'), 'tool_version': TOOL_VERSION,
+        'git_commit': git_commit(repo_dir), 'output_dir': str(output_dir),
+        'config_json': json.dumps(manifest.get('task_config') or {}, ensure_ascii=False, sort_keys=True),
+        'protocol_identity': manifest.get('protocol_identity'),
+        'sample_manifest_identity': manifest.get('sample_manifest_identity'),
+    }
+
+
+def run_plan(plan, *, store: Store, repo_dir: Path, dry_run: bool = False) -> list[AttemptResult]:
+    results = []
+    run_group_base = time.strftime('%Y%m%d_%H%M%S')
+    try:
+        for entry in plan.entries:
+            api_key = _api_key(entry, dry_run=dry_run)
+            attempt_id = new_attempt_id()
+            run_group = f'{run_group_base}_{entry.model_alias}_{entry.suite}_{entry.profile}'
+            output_dir = plan.data_root / 'outputs' / run_group / safe_slug(entry.dataset) / attempt_id
+            raw_cfg = build_raw_task_config(entry, data_root=plan.data_root,
+                                            output_dir=output_dir, api_key=api_key)
+            if dry_run:
+                resolved = {}
+                try:
+                    resolved = resolve_task_config(raw_cfg)
+                except Exception:
+                    pass
+                print(json.dumps({
+                    'attempt_id': attempt_id, 'suite': entry.suite, 'dataset': entry.dataset,
+                    'model_alias': entry.model_alias, 'model_id': entry.model_cfg['model_id'],
+                    'profile': entry.profile, 'per_subset_limit': entry.limit,
+                    'batch_size': entry.batch_size, 'status': entry.status,
+                    'output_dir': str(output_dir),
+                    'protocol_identity': protocol_identity(resolved) if resolved else None,
+                    'requires': list(entry.requires), 'pinned': entry.pinned,
+                }, ensure_ascii=False, indent=2))
+                continue
+            resolved_cfg = resolve_task_config(raw_cfg)
+            try:
+                result = execute_attempt(
+                    entry, store=store, attempt_id=attempt_id, run_group=run_group,
+                    output_dir=output_dir, raw_cfg=raw_cfg, resolved_cfg=resolved_cfg,
+                    repo_dir=repo_dir, data_root=plan.data_root,
+                )
+            except BatchInterrupted:
+                results.append(AttemptResult(attempt_id, output_dir, 'interrupted', 'invalid',
+                                             'interrupted by user', persisted=True))
+                raise
+            results.append(result)
+    except KeyboardInterrupt:
+        raise BatchInterrupted()
+    return results
+
+
+def _api_key(entry, *, dry_run: bool) -> str:
+    env_name = entry.model_cfg.get('api_key_env')
+    if env_name:
+        value = os.environ.get(env_name, '')
+        if value:
+            return value
+    literal = entry.model_cfg.get('api_key')
+    if literal:
+        return literal
+    if dry_run:
+        return 'EMPTY'
+    raise ConfigError(
+        f'{entry.model_alias}: environment variable {env_name!r} is not set'
+    )
