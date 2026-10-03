@@ -1,0 +1,13 @@
+# 被测模型。任何 OpenAI 兼容端点加一行即可，api_key 只写环境变量名，不落盘。
+# batch_size 是并发数；端点有 RPM/TPM 配额就调小它。
+
+models:
+  minimax:
+    model: MiniMax-M3.1-Flash-Preview
+    base_url: https://api.minimax.cn/v1
+    api_key_env: MINIMAX_API_KEY
+    eval_type: openai_api
+    batch_size: 8
+    timeout: 3600
+    generation_config:
+      temperature: 0.0

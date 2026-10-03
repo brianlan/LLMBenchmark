@@ -1,0 +1,5 @@
+outputs/
+__pycache__/
+results/*.db
+results/*.db-wal
+results/*.db-shm

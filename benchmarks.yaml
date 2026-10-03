@@ -1,0 +1,51 @@
+# 三类 benchmark。清单来自「调研模型评测接口」文档的建议，不是 evalscope 全部 200+ 个。
+#
+# limit = 每个 subset 各取 N 题。evalscope 默认不打乱（shuffle=False），所以取到的就是
+# 数据集原序的前 N 题 —— 换模型再跑一次，题目完全一致，可直接对比。
+# 多 subset 的 benchmark limit 已按比例压小，否则题量会翻好几倍。
+#
+# max_tokens: M3.1 是推理模型，thinking token 算在同一个额度里（实测 32768 可以全部烧在
+# 思考上、content 为空、直接判 0 分）。给够额度，再看入库的 truncation_risk 字段判断
+# 是否被截断。单个 benchmark 可在此覆盖。
+
+max_tokens: 32768
+
+suites:
+  reasoning:
+    - {name: gpqa_diamond, limit: 30}
+    - {name: math_500, limit: 10}       # 按 Level 1-5 分 5 个 subset
+    - {name: ifeval, limit: 30}
+    - {name: mmlu_pro, limit: 5}        # 14 个学科 subset
+    - {name: aime25, limit: 30}         # 全量
+    - {name: zebralogicbench, limit: 20}
+
+  coding:
+    # 单题锁定。选它的依据：SWE-bench 官方人工难度标注 = medium(15min-1h)，这一档
+    # 榜单最佳模型只有 55-62% 正确率（easy ~95%、hard ~26%），区分度刚好；
+    # patch 跨 5 个文件；django 的执行环境在 swebench 镜像里最轻最稳。
+    # 数据取自 AI-ModelScope/SWE-bench_Verified 的 django__django-11532，
+    # 已固化成 data/swe_bench_django-11532/test.json（单条记录）。
+    - name: swe_bench_verified_agentic
+      limit: 1
+      dataset_args:
+        local_path: data/swe_bench_django-11532
+      agent_config:
+        max_steps: 30
+    # live_code_bench 不在默认清单里：它的数据集 31G，而且 evalscope 每次加载都会再存一份
+    # （不同 cache key 就是一份），实测能把 80G 的盘直接撑爆。要跑就先把 EVALSCOPE_DATASET_DIR
+    # 指到大盘，再手动加回这一行： {name: live_code_bench, limit: 5}
+    # humaneval_plus 和 bigcodebench 都没放进默认清单：它们的判分要跑代码，evalscope 强制开沙箱，
+    # 而沙箱镜像是在 docker build 阶段 `pip install numpy`（70+ 依赖）——容器默认 bridge 网络出不去，
+    # 这台机器上只能靠 docker build --network=host，evalscope 没给这个开关。
+    # plain humaneval 直接在本机子进程里跑测试，不需要沙箱，所以用它。
+    - {name: humaneval, limit: 30}
+    # bigcodebench 默认不跑：强制要开沙箱（70+ 依赖的镜像），而且 prompt 很长，在 1 核机器上
+    # 8 条之后就挂住了（HTTP 连接停在 CLOSE-WAIT）。要跑就先把那行打开：
+    #   - {name: bigcodebench, limit: 10, extra_args: [--use-sandbox]}
+  vision:
+    - {name: ocr_bench, limit: 5}        # 10 个 subset
+    - {name: ocr_bench_v2, limit: 3}
+    - {name: docvqa, limit: 30}
+    - {name: math_vista, limit: 30}
+    - {name: vstar_bench, limit: 30}
+    - {name: mmmu_pro, limit: 3}         # 多学科 subset
