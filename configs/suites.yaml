@@ -1,0 +1,84 @@
+# Benchmark suites run through EvalScope.
+#
+# profiles:
+#   smoke = connectivity check (few samples), lite = quick comparable slice,
+#   full  = whole dataset unless `full_max_samples` caps it.
+# Dataset spec fields:
+#   core               run by default (core: false needs --include-extensions)
+#   full_max_samples   cap used only by the `full` profile
+#   pinned             always limit=1 (used with a local, pre-filtered dataset)
+#   local_path         local dataset dir; ${DATA_ROOT} expands to --data-root
+#   dataset_args       passed through to EvalScope dataset_args[<dataset>]
+#   extra_params       merged into dataset_args[<dataset>].extra_params
+#   generation_config  merged over the model generation config for this dataset
+#   eval_batch_size    per-dataset override
+#   sandbox            per-dataset override of the suite sandbox config
+
+profiles:
+  smoke: {limit: 5}
+  lite:  {limit: 20}
+  full:  {limit: null}
+
+defaults:
+  eval_batch_size: 4
+
+suites:
+  knowledge:
+    datasets:
+      gpqa_diamond: {core: true}
+      math_500:     {core: true}
+      ifeval:       {core: true}
+      mmlu_pro:         {core: false, full_max_samples: 500}
+      zebralogicbench:  {core: false, full_max_samples: 200}
+
+  swe:
+    # One container per sample; never run these in parallel batches on this host.
+    eval_batch_size: 1
+    sandbox: {enabled: true, engine: docker}
+    datasets:
+      swe_bench_verified:
+        core: true
+        full_max_samples: 50
+        dataset_args:
+          inference_dataset_id: princeton-nlp/SWE-bench_oracle
+      swe_bench_verified_agentic:
+        core: true
+        pinned: true
+        local_path: ${DATA_ROOT}/pinned/swe_bench_verified_django1
+        # EvalScope 1.12 agent budget lives in agent_config; the adapter keeps
+        # strategy=swe_bench_toolcall / max_steps=250 defaults when omitted.
+        agent_config:
+          mode: native
+          max_steps: 250
+          command_timeout: 60.0
+        extra_params:
+          build_docker_images: true
+          pull_remote_images_if_available: true
+        generation_config:
+          temperature: 0.7
+          parallel_tool_calls: true
+          stream: true
+      live_code_bench:
+        core: true
+        # 28 subsets x limit items; execute in parallel instead of one by one.
+        eval_batch_size: 4
+        full_max_samples: 100
+      swe_bench_pro:            {core: false}
+      terminal_bench_v2_1:      {core: false}
+      swe_bench_lite_agentic:   {core: false}
+      bigcodebench:             {core: false}
+
+  vision:
+    datasets:
+      ocr_bench_v2: {core: true, full_max_samples: 1000}
+      docvqa:       {core: true, full_max_samples: 1000}
+      math_vista:   {core: true}
+      ocr_bench:            {core: false}
+      cc_ocr_v2:            {core: false, full_max_samples: 500}
+      mmmu:                 {core: false}
+      mmmu_pro:             {core: false, full_max_samples: 500}
+      vstar_bench:          {core: false}
+      chartqa:              {core: false}
+      omni_doc_bench_v1_6:  {core: false}
+      olmocr_bench:         {core: false}
+      maritime_ocr_bench:   {core: false}
