@@ -3,3 +3,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
+
+# local run data / secrets (the canonical data root is outside the repo)
+*.db
+*.db-wal
+*.db-shm
+outputs/
+.env
+.env.*
