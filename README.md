@@ -203,6 +203,15 @@ evaluated with the same shared rule as the summary: an existing
 model id, model-config identity, protocol identity and sample-manifest
 identity are compared with the stored row first; a conflict is rejected
 (`identity_conflict`) instead of writing B's score under A's identity.
+A missing identity value is not a wildcard: when the stored row has a value
+and the import cannot prove the same one, the import is rejected too.  The
+model identity may be recovered from `report_id` (whose ownership was already
+validated) and the sample-manifest identity from the recomputed digest of the
+manifest rows; a declared identity that does not match its own content is
+rejected as well.  The rejection result (`reason` and `conflicts`) and the
+audit file are redacted with the secrets collected from the manifest, so
+secrets in identity fields cannot reach stdout/stderr.  Moving the same
+output directory elsewhere still re-imports normally.
 The previous metrics are untouched and the rejection is audited in
 `run_import_rejected.json`.  The evidence file is written before the database
 commit; if either step fails the CLI reports exactly which one was updated.

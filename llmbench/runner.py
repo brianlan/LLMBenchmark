@@ -502,20 +502,32 @@ def _pretty_name(dataset: str):
         return None
 
 
-def _identity_conflicts(manifest: dict, existing) -> list:
+def _identity_conflicts(manifest: dict, existing, effective_manifest_identity=None) -> list:
     """Compare immutable run identity between the manifest and the DB row.
 
-    Moving an output directory is fine; rebinding a stored result to another
-    dataset/model/protocol/manifest is not.
+    Missing evidence is not treated as a wildcard: if the stored row has a
+    value and the import cannot prove the same value, the conflict is reported.
+    ``model_id`` may be recovered from ``report_id`` (the report's own model
+    name was validated by ``locate_report``); the sample manifest identity may
+    be recovered from the recomputed digest.
     """
-    fields = ('dataset', 'suite', 'model_id', 'model_config_identity',
-              'protocol_identity', 'sample_manifest_identity')
-    conflicts = []
     existing_keys = set(existing.keys()) if hasattr(existing, 'keys') else set()
-    for field in fields:
-        new_value = manifest.get(field)
+    effective = {
+        'dataset': manifest.get('dataset'),
+        'suite': manifest.get('suite'),
+        'model_id': manifest.get('model_id') or manifest.get('report_id'),
+        'model_config_identity': manifest.get('model_config_identity'),
+        'protocol_identity': manifest.get('protocol_identity'),
+        'sample_manifest_identity': effective_manifest_identity,
+    }
+    conflicts = []
+    for field, new_value in effective.items():
         old_value = existing[field] if field in existing_keys else None
-        if new_value and old_value and str(new_value) != str(old_value):
+        if not old_value:
+            continue
+        if new_value is None or str(new_value) == '':
+            conflicts.append(f'{field}: db={old_value} manifest=<missing>')
+        elif str(new_value) != str(old_value):
             conflicts.append(f'{field}: db={old_value} manifest={new_value}')
     return conflicts
 
@@ -558,7 +570,11 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             manifest.get('sample_manifest_detail') or {}
         )
         coverage_rows = apply_coverage(raw_rows, output_evidence)
-        manifest_identity = manifest.get('sample_manifest_identity') or (digest(raw_rows) if raw_rows else None)
+        declared_identity = manifest.get('sample_manifest_identity')
+        computed_identity = digest(raw_rows) if raw_rows else None
+        manifest_identity = declared_identity or computed_identity
+        identity_inconsistent = bool(
+            declared_identity and computed_identity and declared_identity != computed_identity)
         outcome = assess_run(
             report_error=None, metrics=metrics,
             execution_summary=report.get('execution_summary'), manifest_rows=coverage_rows,
@@ -602,7 +618,10 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'reason': redact_text(f'{exc.__class__.__name__}: {exc}', secrets),
         }
 
-    conflicts = _identity_conflicts(manifest, existing) if existing is not None else []
+    conflicts = _identity_conflicts(manifest, existing, manifest_identity) if existing is not None else []
+    if existing is not None and identity_inconsistent:
+        conflicts.append(
+            f'sample_manifest_identity: declared={declared_identity} computed={computed_identity}')
     if conflicts:
         audit = {
             'run_id': run_id, 'kind': 'identity_conflict', 'rejected_at': now_iso(),
@@ -613,14 +632,14 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'report_path': str(report_path),
         }
         _write_audit(output_dir, 'run_import_rejected.json', audit, secrets)
-        return {
+        return redact({
             'run_id': run_id, 'status': 'rejected', 'committed': False,
             'reason': 'identity_conflict: ' + '; '.join(conflicts),
             'conflicts': conflicts,
             'validity_status': existing['validity_status'],
             'comparability': existing['comparability'],
             'metrics_kept': existing_metrics,
-        }
+        }, secrets)
 
     accepted_existing = {'complete', 'partial'}
     existing_eligible = existing is not None and has_formal_eligibility(
@@ -645,7 +664,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'report_path': str(report_path),
         }
         _write_audit(output_dir, 'run_import_rejected.json', audit, secrets)
-        return {
+        return redact({
             'run_id': run_id, 'status': 'rejected', 'committed': False,
             'validity_status': existing['validity_status'],
             'comparability': existing['comparability'],
@@ -653,7 +672,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'new_comparability': safe_outcome['comparability'],
             'reason': safe_outcome['status_reason'],
             'metrics_kept': existing_metrics,
-        }
+        }, secrets)
 
     # Write the evidence file before committing: if it fails, the database still
     # holds the previous state and the CLI can say so truthfully.

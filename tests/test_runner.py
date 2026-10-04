@@ -11,7 +11,7 @@ import llmbench.runner as runner
 from llmbench.config import ConfigError, Plan, PlanEntry, build_plan
 from llmbench.evidence import MetricParseError, ReportError
 from llmbench.store import Store
-from llmbench.util import read_json
+from llmbench.util import digest, read_json
 
 MODEL_ID = 'MiniMax-M3.1-Flash-Preview'
 MODEL_CFG = {
@@ -777,3 +777,151 @@ def test_p2_interrupt_during_assessment_terminates_attempt(tmp_path, monkeypatch
     row = store.conn.execute('SELECT execution_status, validity_status FROM runs').fetchone()
     assert row['execution_status'] == 'interrupted' and row['validity_status'] == 'invalid'
     store.close()
+
+
+def _mutate_manifest(attempt_dir, **changes):
+    path = attempt_dir / 'run_manifest.json'
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    for key, value in changes.items():
+        manifest[key] = value
+    path.write_text(json.dumps(manifest), encoding='utf-8')
+    return manifest
+
+
+def _primary_score(store, run_id):
+    return store.conn.execute(
+        'SELECT score FROM metrics WHERE run_id=? AND is_primary=1', (run_id,)).fetchone()['score']
+
+
+@pytest.mark.parametrize('mode', ['missing', 'none', 'empty'])
+def test_incomplete_model_identity_cannot_replace_existing_run(tmp_path, mode):
+    a_dir, b_dir = tmp_path / 'a', tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-1', model_id='Model-A', score=0.8)
+    _write_standalone_attempt(b_dir, 'run-1', model_id='Model-B', score=0.2)
+    manifest = json.loads((b_dir / 'run_manifest.json').read_text(encoding='utf-8'))
+    manifest.pop('model_id')
+    manifest.pop('model_config_identity')
+    if mode in ('none', 'empty'):
+        blank = None if mode == 'none' else ''
+        manifest['model_id'] = blank
+        manifest['model_config_identity'] = blank
+    (b_dir / 'run_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        first = runner.import_output(a_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert first['status'] == 'committed'
+
+        second = runner.import_output(b_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert second['status'] == 'rejected' and second['committed'] is False
+        assert 'model_id' in second['reason']
+        assert store.get_attempt('run-1')['model_id'] == 'Model-A'
+        assert _primary_score(store, 'run-1') == 0.8
+    finally:
+        store.close()
+
+
+def test_recomputed_sample_identity_conflict_is_rejected(tmp_path):
+    a_dir, b_dir = tmp_path / 'a', tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-s', model_id='Model-A', score=0.8)
+    _write_standalone_attempt(b_dir, 'run-s', model_id='Model-A', score=0.2)
+    rows_a = [{'subset': 'gpqa_diamond', 'sample_ids': ['1', '2']}]
+    rows_b = [{'subset': 'gpqa_diamond', 'sample_ids': ['3', '4']}]
+    _mutate_manifest(a_dir, sample_manifest=rows_a, sample_manifest_identity=digest(rows_a))
+    manifest_b = json.loads((b_dir / 'run_manifest.json').read_text(encoding='utf-8'))
+    manifest_b.pop('sample_manifest_identity')
+    manifest_b['sample_manifest'] = rows_b
+    (b_dir / 'run_manifest.json').write_text(json.dumps(manifest_b), encoding='utf-8')
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        assert runner.import_output(a_dir, store, repo_dir=tmp_path,
+                                    data_root=tmp_path)['status'] == 'committed'
+        stored_identity = store.get_attempt('run-s')['sample_manifest_identity']
+        second = runner.import_output(b_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert second['status'] == 'rejected'
+        assert 'sample_manifest_identity' in second['reason']
+        assert store.get_attempt('run-s')['sample_manifest_identity'] == stored_identity
+        assert _primary_score(store, 'run-s') == 0.8
+    finally:
+        store.close()
+
+
+def test_declared_sample_identity_must_match_content(tmp_path):
+    a_dir, b_dir = tmp_path / 'a', tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-d', model_id='Model-A', score=0.8)
+    _write_standalone_attempt(b_dir, 'run-d', model_id='Model-A', score=0.2)
+    rows_a = [{'subset': 'gpqa_diamond', 'sample_ids': ['1', '2']}]
+    rows_b = [{'subset': 'gpqa_diamond', 'sample_ids': ['3', '4']}]
+    _mutate_manifest(a_dir, sample_manifest=rows_a, sample_manifest_identity=digest(rows_a))
+    # same declared identity as the stored run, but the content it claims to cover is different
+    _mutate_manifest(b_dir, sample_manifest=rows_b, sample_manifest_identity=digest(rows_a))
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        assert runner.import_output(a_dir, store, repo_dir=tmp_path,
+                                    data_root=tmp_path)['status'] == 'committed'
+        second = runner.import_output(b_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert second['status'] == 'rejected'
+        assert 'declared=' in second['reason']
+        assert _primary_score(store, 'run-d') == 0.8
+    finally:
+        store.close()
+
+
+def test_moved_output_directory_can_be_reimported(tmp_path):
+    a_dir = tmp_path / 'a'
+    _write_standalone_attempt(a_dir, 'run-m', model_id='Model-A', score=0.8)
+    moved = tmp_path / 'moved'
+    shutil.copytree(a_dir, moved)
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        assert runner.import_output(a_dir, store, repo_dir=tmp_path,
+                                    data_root=tmp_path)['status'] == 'committed'
+        again = runner.import_output(moved, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert again['status'] == 'committed'
+        assert again['committed'] is True
+        assert _primary_score(store, 'run-m') == 0.8
+    finally:
+        store.close()
+
+
+def test_identity_conflict_rejection_is_redacted(tmp_path):
+    a_dir, b_dir = tmp_path / 'a', tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-r', model_id='Model-A', score=0.8)
+    # the conflicting identity itself carries the opaque secret; the manifest also
+    # declares it as the api key so the boundary knows the value
+    _write_standalone_attempt(b_dir, 'run-r', model_id=OPAQUE_SECRET, score=0.2)
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        assert runner.import_output(a_dir, store, repo_dir=tmp_path,
+                                    data_root=tmp_path)['status'] == 'committed'
+        second = runner.import_output(b_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert second['status'] == 'rejected'
+        assert OPAQUE_SECRET not in json.dumps(second, ensure_ascii=False)
+        assert '***' in second['reason']
+        assert OPAQUE_SECRET not in (b_dir / 'run_import_rejected.json').read_text(encoding='utf-8')
+        assert _primary_score(store, 'run-r') == 0.8
+    finally:
+        store.close()
+
+
+def test_identity_conflict_cli_output_is_redacted(tmp_path, capsys):
+    from llmbench.cli import main
+
+    a_dir, b_dir = tmp_path / 'a', tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-r-cli', model_id='Model-A', score=0.8)
+    _write_standalone_attempt(b_dir, 'run-r-cli', model_id=OPAQUE_SECRET, score=0.2)
+    db = tmp_path / 'results.db'
+
+    assert main(['import', '--output-dir', str(a_dir), '--data-root', str(tmp_path),
+                 '--db', str(db)]) == 0
+    capsys.readouterr()
+    exit_code = main(['import', '--output-dir', str(b_dir), '--data-root', str(tmp_path),
+                      '--db', str(db)])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert OPAQUE_SECRET not in captured.out and OPAQUE_SECRET not in captured.err
+    assert 'import rejected' in captured.err
