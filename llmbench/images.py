@@ -67,15 +67,32 @@ def _attempt_started_at(output_dir) -> str | None:
 
 
 def collect_owned_candidates(output_dirs) -> dict:
-    """Map each referenced image to the earliest attempt that referenced it."""
+    """Map each referenced image to the attempt that referenced it.
+
+    Each value is ``{'attempt_start': iso, 'baseline': [images] | None}`` where
+    ``baseline`` is the pre-run image inventory recorded in the attempt
+    manifest (None means the inventory could not be taken).
+    """
     candidates = {}
     for output_dir in output_dirs:
+        manifest = Path(output_dir) / 'run_manifest.json'
         started_at = _attempt_started_at(output_dir)
-        if started_at is None:
-            continue
+        baseline = None
+        try:
+            data = json.loads(manifest.read_text(encoding='utf-8'))
+            baseline = data.get('baseline_swe_images')
+        except (OSError, json.JSONDecodeError, ValueError):
+            baseline = None
+        entry = {'attempt_start': started_at, 'baseline': baseline}
         for image in _referenced_images(output_dir):
-            if image not in candidates or started_at < candidates[image]:
-                candidates[image] = started_at
+            current = candidates.get(image)
+            if current is None:
+                candidates[image] = entry
+            elif current.get('baseline') is None and baseline is not None:
+                candidates[image] = entry
+            elif baseline is not None and started_at and (
+                    current.get('attempt_start') or '~') > started_at:
+                candidates[image] = entry
     return candidates
 
 
@@ -132,12 +149,24 @@ def cleanup_owned_images(images, *, created_after=None, image_created=None,
             continue
         if image in in_use:
             continue
-        started_at = created_after.get(image) if isinstance(created_after, dict) else created_after
+        spec = created_after.get(image) if isinstance(created_after, dict) else created_after
+        if isinstance(spec, dict):
+            started_at = spec.get('attempt_start')
+            baseline = spec.get('baseline')
+        else:
+            started_at = spec
+            baseline = None
         created = None
         try:
             created = image_created(image)
         except Exception as exc:  # noqa: BLE001 - cannot prove ownership, keep the image
             unproven[image] = f'inspect failed: {exc.__class__.__name__}: {exc}'
+            continue
+        if isinstance(spec, dict) and baseline is not None and image in set(baseline):
+            unproven[image] = 'present in the pre-run image inventory'
+            continue
+        if isinstance(spec, dict) and baseline is None:
+            unproven[image] = 'no pre-run image inventory was recorded'
             continue
         if _created_since(created, started_at):
             owned.append(image)

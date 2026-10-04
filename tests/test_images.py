@@ -38,7 +38,8 @@ def test_collect_owned_candidates_records_attempt_start(tmp_path):
     out = tmp_path / 'attempt'
     write_manifest(out, created_at='2026-01-02T03:04:05+00:00')
     write_predictions(out, [{'index': 0, 'metadata': {'docker_image': 'swebench/a:latest'}}])
-    assert collect_owned_candidates([out]) == {'swebench/a:latest': '2026-01-02T03:04:05+00:00'}
+    assert collect_owned_candidates([out]) == {
+        'swebench/a:latest': {'attempt_start': '2026-01-02T03:04:05+00:00', 'baseline': None}}
 
 
 def test_preexisting_image_is_kept_even_if_reused(tmp_path):
@@ -141,3 +142,47 @@ def test_candidate_mapping_is_accepted_directly():
     )
     assert report['removed'] == ['swebench/a:latest']
     assert removed == ['swebench/a:latest']
+
+
+def _candidate(start='2026-01-02T00:00:00+00:00', baseline=None):
+    return {'attempt_start': start, 'baseline': baseline}
+
+
+def test_image_in_prerun_inventory_is_kept_even_if_created_later():
+    report = cleanup_owned_images(
+        {'swebench/shared:latest'},
+        created_after={'swebench/shared:latest': _candidate(baseline=['swebench/shared:latest'])},
+        image_created=lambda image: '2026-01-02T00:10:00+00:00',
+        image_lister=lambda: ['swebench/shared:latest'],
+        container_lister=lambda: [],
+        remover=lambda names: None,
+    )
+    assert report['removed'] == []
+    assert 'inventory' in report['unproven']['swebench/shared:latest']
+
+
+def test_new_image_absent_from_prerun_inventory_is_removed():
+    removed = []
+    report = cleanup_owned_images(
+        {'swebench/built:latest'},
+        created_after={'swebench/built:latest': _candidate(baseline=['swebench/other:latest'])},
+        image_created=lambda image: '2026-01-02T00:10:00+00:00',
+        image_lister=lambda: ['swebench/built:latest'],
+        container_lister=lambda: [],
+        remover=removed.extend,
+    )
+    assert report['removed'] == ['swebench/built:latest']
+    assert removed == ['swebench/built:latest']
+
+
+def test_missing_prerun_inventory_keeps_the_image():
+    report = cleanup_owned_images(
+        {'swebench/built:latest'},
+        created_after={'swebench/built:latest': _candidate(baseline=None)},
+        image_created=lambda image: '2026-01-02T00:10:00+00:00',
+        image_lister=lambda: ['swebench/built:latest'],
+        container_lister=lambda: [],
+        remover=lambda names: None,
+    )
+    assert report['removed'] == []
+    assert 'inventory' in report['unproven']['swebench/built:latest']

@@ -27,6 +27,7 @@ from .evidence import (
     summarize_diagnostics,
     write_run_manifest,
 )
+from .images import SWE_IMAGE_PREFIXES
 from .store import DuplicateAttemptError, Store
 from .util import (
     atomic_write_json,
@@ -263,6 +264,18 @@ def _plain_failure(attempt_id: str, output_dir: Path, message: str, secrets) -> 
     return AttemptResult(attempt_id, output_dir, 'failed', 'invalid', reason, False, reason)
 
 
+def _swe_image_snapshot():
+    """Pre-run SWE image inventory; None means ownership cannot be proven."""
+    try:
+        output = subprocess.check_output(
+            ['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'],
+            text=True, stderr=subprocess.DEVNULL, timeout=60,
+        )
+        return [line for line in output.splitlines() if line.startswith(SWE_IMAGE_PREFIXES)]
+    except Exception:
+        return None
+
+
 def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, output_dir: Path,
                     raw_cfg: dict, resolved_cfg: dict, repo_dir: Path, data_root: Path) -> AttemptResult:
     """Run one attempt inside a complete error boundary.
@@ -283,6 +296,9 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
         entry, attempt_id=attempt_id, run_group=run_group, output_dir=output_dir,
         raw_cfg=raw_cfg, resolved_cfg=resolved_cfg, repo_dir=repo_dir, data_root=data_root,
     )
+    if entry.spec.get('requires_sandbox'):
+        # Snapshot before the run so an image can be proven to be new later.
+        manifest['baseline_swe_images'] = _swe_image_snapshot()
     try:
         store.start_attempt(_attempt_record(entry, attempt_id=attempt_id, run_group=run_group,
                                             output_dir=output_dir, raw_cfg=raw_cfg,

@@ -218,9 +218,11 @@ Each attempt directory keeps the evidence needed to audit or re-import it:
   fallback to host execution**.
 - `--cleanup-images` deletes only images that this run provably created: they
   must be referenced by this run's own predictions, unused by any container,
-  and their Docker creation time must not be older than the attempt that
-  referenced them (`docker image inspect`).  The CLI passes each attempt's
-  start time to the cleanup; anything unprovable is kept and failed removals
+  absent from the pre-run image inventory recorded in the attempt manifest
+  (when the inventory could not be taken, nothing is removed), and their
+  Docker creation time must not be older than the attempt that referenced
+  them (`docker image inspect`).  The CLI passes each attempt's start time and
+  inventory to the cleanup; anything unprovable is kept and failed removals
   are reported.
 - `--dry-run` has zero side effects: no key access, no database, no Docker, no
   downloads.

@@ -595,3 +595,14 @@ def test_b4_assessment_exception_terminates_attempt_and_continues(tmp_path, monk
     diagnostics = json.loads(row['diagnostics_json'])
     assert diagnostics['attempt_error_phase'] == 'assessment'
     store.close()
+
+
+def test_sandbox_attempt_records_prerun_image_inventory(tmp_path, monkeypatch):
+    entry_obj = entry()
+    entry_obj.spec = {'requires_sandbox': True, 'sandbox': {'enabled': True, 'engine': 'docker'}}
+    monkeypatch.setattr(runner, '_swe_image_snapshot', lambda: ['swebench/old:latest'])
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(), entry_obj=entry_obj)
+    assert result.validity_status == 'complete'
+    manifest = read_json(output_dir / 'run_manifest.json')
+    assert manifest['baseline_swe_images'] == ['swebench/old:latest']
+    store.close()
