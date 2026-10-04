@@ -120,9 +120,10 @@ per attempt:
   - `partial` — some samples errored; shown in the formal table only with
     `--allow-partial`, and then explicitly marked.
   - `unverified` — evidence insufficient to certify completion or the primary
-    score (missing execution summary, non-integer count fields, requested >
-    manifest selected, missing primary metric identity, NULL primary score,
-    aggregate count above succeeded).
+    score (missing execution summary, non-integer count fields, internally
+    inconsistent counts such as succeeded > requested, requested > manifest
+    selected, missing primary metric identity, NULL primary score, aggregate
+    count above succeeded).
   - `invalid` — missing/ambiguous/foreign/corrupt report, no quality metric,
     non-quality or malformed primary identity (including an identity that only
     has a display fallback name), all samples failed, interrupted or failed run.
@@ -195,13 +196,21 @@ exit code into `1`.
 
 `import` is idempotent, never rewrites the original evaluation `finished_at`
 (only `imported_at` is updated) and **rejects** a re-parse that would downgrade
-an already accepted run.  "Downgrade" is evaluated with the same shared rule
-as the summary: an existing `complete`+`verified` result stays in place if the
-new parse is not `complete`+`verified` (including `verified → unknown`), the
-previous metrics are untouched, and the rejection is audited in
+an already accepted run or rebind it to another identity.  "Downgrade" is
+evaluated with the same shared rule as the summary: an existing
+`complete`+`verified` result stays in place if the new parse is not
+`complete`+`verified` (including `verified → unknown`).  Dataset, suite,
+model id, model-config identity, protocol identity and sample-manifest
+identity are compared with the stored row first; a conflict is rejected
+(`identity_conflict`) instead of writing B's score under A's identity.
+The previous metrics are untouched and the rejection is audited in
 `run_import_rejected.json`.  The evidence file is written before the database
 commit; if either step fails the CLI reports exactly which one was updated.
-Schema v3 adds empty migration columns for the extra coverage evidence.
+A first import creates the run and writes its final state in one transaction,
+so a failed first import cannot leave a `running` row.  Parse failures are
+returned as a structured result whose reason is redacted with the secrets
+collected from the manifest.  Schema v3 adds empty migration columns for the
+extra coverage evidence.
 
 Each attempt directory keeps the evidence needed to audit or re-import it:
 `run_manifest.json` (redacted plan + config + identities),
@@ -216,14 +225,13 @@ Each attempt directory keeps the evidence needed to audit or re-import it:
   URL credentials and provider key patterns).
 - Sandboxed benchmarks refuse to run when Docker is unavailable; there is **no
   fallback to host execution**.
-- `--cleanup-images` deletes only images that this run provably created: they
-  must be referenced by this run's own predictions, unused by any container,
-  absent from the pre-run image inventory recorded in the attempt manifest
-  (when the inventory could not be taken, nothing is removed), and their
-  Docker creation time must not be older than the attempt that referenced
-  them (`docker image inspect`).  The CLI passes each attempt's start time and
-  inventory to the cleanup; anything unprovable is kept and failed removals
-  are reported.
+- `--cleanup-images` is intended for **serial, exclusive Docker hosts**.  It
+  deletes only images referenced by this run's own predictions, unused by any
+  container, absent from the pre-run inventory recorded in the attempt
+  manifest, and created no earlier than the attempt start.  The inventory and
+  creation time prove an image appeared during the run, not exclusive
+  ownership, so on shared or concurrent Docker hosts leave this flag off;
+  anything unprovable is kept and failed removals are reported.
 - `--dry-run` has zero side effects: no key access, no database, no Docker, no
   downloads.
 - `prepare` writes to a staging directory and atomically replaces the pinned

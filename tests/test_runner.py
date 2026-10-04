@@ -212,8 +212,8 @@ def test_import_is_idempotent_and_does_not_erase_scores_on_failure(tmp_path, mon
     # a broken report must fail the import and leave the previous scores intact
     report_path = output_dir / 'reports' / MODEL_ID / 'gpqa_diamond.json'
     report_path.write_text('{broken', encoding='utf-8')
-    with pytest.raises(ReportError):
-        runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    failed = runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert failed['status'] == 'failed' and failed['committed'] is False
     assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == count
     store.close()
 
@@ -605,4 +605,175 @@ def test_sandbox_attempt_records_prerun_image_inventory(tmp_path, monkeypatch):
     assert result.validity_status == 'complete'
     manifest = read_json(output_dir / 'run_manifest.json')
     assert manifest['baseline_swe_images'] == ['swebench/old:latest']
+    store.close()
+
+
+OPAQUE_SECRET = 'provider_opaque_secret_6c177eaa'
+
+
+def _standalone_manifest(attempt_id, model_id='Model-A', dataset='gpqa_diamond',
+                         api_key=OPAQUE_SECRET, protocol='proto-standalone',
+                         manifest_identity='sm-standalone'):
+    return {
+        'attempt_id': attempt_id, 'run_group': 'g', 'dataset': dataset,
+        'model_alias': 'minimax', 'model_id': model_id, 'report_id': model_id,
+        'suite': 'knowledge', 'profile': 'lite', 'created_at': '2026-01-01T00:00:00+00:00',
+        'model_config_identity': f'mci-{model_id}', 'protocol_identity': protocol,
+        'sample_manifest_identity': manifest_identity, 'task_config': {'api_key': api_key},
+    }
+
+
+def _write_standalone_attempt(root, attempt_id, *, model_id='Model-A', dataset='gpqa_diamond',
+                              score=0.8, api_key=OPAQUE_SECRET, metrics=None):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'run_manifest.json').write_text(json.dumps(
+        _standalone_manifest(attempt_id, model_id=model_id, dataset=dataset, api_key=api_key),
+        ensure_ascii=False), encoding='utf-8')
+    report_dir = root / 'reports' / model_id
+    report_dir.mkdir(parents=True, exist_ok=True)
+    if metrics is None:
+        metrics = [{
+            'identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+            'score': score, 'num': 1, 'categories': [], 'semantics': {'kind': 'quality'},
+        }]
+    (report_dir / f'{dataset}.json').write_text(json.dumps({
+        'dataset_name': dataset, 'model_name': model_id, 'metrics': metrics,
+        'primary_metric_identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+        'execution_summary': {'requested': 1, 'succeeded': 1, 'errored': 0, 'incomplete': False},
+    }), encoding='utf-8')
+
+
+def test_p1_import_identity_conflict_is_rejected(tmp_path):
+    a_dir = tmp_path / 'a'
+    b_dir = tmp_path / 'b'
+    _write_standalone_attempt(a_dir, 'run-1', model_id='Model-A', score=0.8)
+    _write_standalone_attempt(b_dir, 'run-1', model_id='Model-B', score=0.2)
+    store = Store(tmp_path / 'results.db')
+
+    first = runner.import_output(a_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert first['status'] == 'committed'
+    finished_before = store.get_attempt('run-1')['finished_at']
+
+    second = runner.import_output(b_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert second['status'] == 'rejected'
+    assert second['committed'] is False
+    assert 'identity_conflict' in second['reason']
+    assert any('model_id' in conflict for conflict in second['conflicts'])
+
+    row = store.get_attempt('run-1')
+    assert row['model_id'] == 'Model-A'
+    assert row['finished_at'] == finished_before
+    score = store.conn.execute(
+        'SELECT score FROM metrics WHERE run_id=? AND is_primary=1', ('run-1',)).fetchone()['score']
+    assert score == 0.8
+    audit = read_json(b_dir / 'run_import_rejected.json')
+    assert audit['kind'] == 'identity_conflict'
+    store.close()
+
+
+def test_p1_import_redacts_known_secret_without_pattern(tmp_path, monkeypatch):
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-secret')
+    monkeypatch.setattr(runner, 'metric_rows', lambda report: (_ for _ in ()).throw(
+        RuntimeError(f'provider returned {OPAQUE_SECRET} while scoring')))
+    store = Store(tmp_path / 'results.db')
+    result = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert result['status'] == 'failed'
+    assert OPAQUE_SECRET not in result['reason']
+    assert '***' in result['reason']
+    assert not store.attempt_exists('run-secret')
+    store.close()
+
+
+def test_p1_import_cli_redacts_known_secret(tmp_path, monkeypatch, capsys):
+    from llmbench.cli import main
+
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-secret-cli')
+    monkeypatch.setattr(runner, 'metric_rows', lambda report: (_ for _ in ()).throw(
+        RuntimeError(f'provider returned {OPAQUE_SECRET} while scoring')))
+    exit_code = main([
+        'import', '--output-dir', str(attempt), '--data-root', str(tmp_path),
+        '--db', str(tmp_path / 'results.db'),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert OPAQUE_SECRET not in captured.err and OPAQUE_SECRET not in captured.out
+    assert '***' in captured.err
+
+
+def test_p2_first_import_is_atomic_and_leaves_no_running_row(tmp_path, monkeypatch):
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-atomic')
+    store = Store(tmp_path / 'results.db')
+
+    def boom(run_id, outcome):
+        raise RuntimeError('metrics write failed')
+
+    monkeypatch.setattr(store, '_write_outcome', boom)
+    result = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert result['status'] == 'failed' and result['committed'] is False
+    assert store.attempt_exists('run-atomic') is False
+    assert store.conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE execution_status='running'").fetchone()['n'] == 0
+    store.close()
+
+
+def test_p2_duplicate_metric_identity_is_rejected_before_persistence(tmp_path):
+    duplicate = {
+        'identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+        'score': 0.5, 'num': 1, 'categories': [], 'semantics': {'kind': 'quality'},
+    }
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-dup', metrics=[duplicate, dict(duplicate)])
+    store = Store(tmp_path / 'results.db')
+    result = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert result['status'] == 'failed'
+    assert 'duplicate metric identity' in result['reason']
+    assert store.attempt_exists('run-dup') is False
+    store.close()
+
+
+def test_p2_duplicate_metric_identity_marks_run_invalid(tmp_path, monkeypatch):
+    duplicate = {
+        'identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+        'score': 0.5, 'num': 5, 'categories': [], 'semantics': {'kind': 'quality'},
+    }
+
+    def run_task(cfg):
+        dataset = cfg['datasets'][0]
+        write_report(Path(cfg['work_dir']), dataset=dataset,
+                     raw={'dataset_name': dataset, 'model_name': MODEL_ID,
+                          'metrics': [duplicate, dict(duplicate)],
+                          'execution_summary': {'requested': 5, 'succeeded': 5,
+                                                'errored': 0, 'incomplete': False}})
+
+    result, store, _ = execute(tmp_path, monkeypatch, run_task)
+    assert result.execution_status == 'completed'
+    assert result.validity_status == 'invalid'
+    assert 'report_metric_parse_error' in result.status_reason
+    store.close()
+
+
+def test_p2_interrupt_during_assessment_terminates_attempt(tmp_path, monkeypatch):
+    calls = []
+
+    def run_task(cfg):
+        dataset = cfg['datasets'][0]
+        calls.append(dataset)
+        write_report(Path(cfg['work_dir']), dataset=dataset)
+        write_jsonl(Path(cfg['work_dir']), 'predictions', dataset=dataset)
+        write_jsonl(Path(cfg['work_dir']), 'reviews', dataset=dataset)
+
+    monkeypatch.setattr(runner, 'apply_coverage', lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    stub_evalscope(monkeypatch, run_task)
+    plan = Plan(data_root=tmp_path, profile='lite', entries=[entry('gpqa_diamond'), entry('math_500')])
+    store = Store(tmp_path / 'results.db')
+    with pytest.raises(runner.BatchInterrupted):
+        runner.run_plan(plan, store=store, repo_dir=tmp_path)
+    assert calls == ['gpqa_diamond']  # the second attempt is never started
+    assert store.conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE execution_status='running'").fetchone()['n'] == 0
+    row = store.conn.execute('SELECT execution_status, validity_status FROM runs').fetchone()
+    assert row['execution_status'] == 'interrupted' and row['validity_status'] == 'invalid'
     store.close()

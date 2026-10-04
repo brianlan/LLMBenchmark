@@ -205,3 +205,27 @@ def test_comparability_verified_and_unknown():
     status, reasons = assess_comparability([], evidence)
     assert status == COMPARABILITY_UNKNOWN
     assert 'no_sample_manifest' in reasons
+
+
+def test_contradictory_execution_counts_are_unverified():
+    result = assess_run(
+        metrics=[quality_metric(num=5)],
+        execution_summary={'requested': 1, 'succeeded': 5, 'errored': 0, 'incomplete': False},
+        manifest_rows=[manifest_row(selected=5)],
+    )
+    assert result['validity_status'] == UNVERIFIED
+    assert 'inconsistent_execution_summary' in result['status_reason']
+
+    result = assess_run(
+        metrics=[quality_metric(num=5)],
+        execution_summary={'requested': 5, 'succeeded': 3, 'errored': 5, 'incomplete': False},
+    )
+    assert result['validity_status'] == UNVERIFIED
+    assert 'inconsistent_execution_summary' in result['status_reason']
+
+    result = assess_run(
+        metrics=[quality_metric(num=5)],
+        execution_summary={'requested': 5, 'succeeded': -1, 'errored': 0, 'incomplete': False},
+    )
+    assert result['validity_status'] == UNVERIFIED
+    assert 'inconsistent_execution_summary' in result['status_reason']

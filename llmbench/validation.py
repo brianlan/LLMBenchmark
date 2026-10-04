@@ -118,6 +118,21 @@ def assess_run(*, interrupted=False, task_error=None, report_error=None, metrics
         _reason(reasons, 'invalid_execution_summary', 'incomplete must be a boolean')
         return _outcome(COMPLETED, UNVERIFIED, reasons)
     errored = errored or 0
+    if any(value is not None and value < 0 for value in (requested, succeeded, errored)):
+        _reason(reasons, 'inconsistent_execution_summary', 'negative counts')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
+    if requested is not None and succeeded is not None and succeeded > requested:
+        _reason(reasons, 'inconsistent_execution_summary',
+                f'succeeded={succeeded} > requested={requested}')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
+    if requested is not None and errored > requested:
+        _reason(reasons, 'inconsistent_execution_summary',
+                f'errored={errored} > requested={requested}')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
+    if requested is not None and succeeded is not None and succeeded + errored > requested:
+        _reason(reasons, 'inconsistent_execution_summary',
+                f'succeeded+errored={succeeded + errored} > requested={requested}')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
     if requested is None or requested <= 0:
         _reason(reasons, 'no_requested_samples')
         return _outcome(COMPLETED, UNVERIFIED, reasons)

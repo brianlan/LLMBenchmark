@@ -245,7 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument('--allow-partial', action='store_true',
                        help='treat partial runs as acceptable and show them in the formal table')
     run_p.add_argument('--cleanup-images', action='store_true',
-                       help='remove only images this run provably owns and that are not in use')
+                       help='remove only images this run provably created (serial, exclusive '
+                            'Docker hosts only; never a global prune)')
     run_p.add_argument('--dry-run', action='store_true',
                        help='print the plan without keys, DB, Docker or downloads')
 

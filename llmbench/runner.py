@@ -384,6 +384,19 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
         diagnostics['comparability_reasons'] = comparability_reasons
         diagnostics['raw_output_dir'] = str(output_dir)
         diagnostics['repeat_policy'] = 'review keys are matched against prediction keys'
+    except KeyboardInterrupt:
+        # User interrupt during assessment must terminate this attempt too.
+        interrupted = True
+        outcome = assess_run(interrupted=True)
+        diagnostics = {
+            'attempt_error_phase': assessment_phase,
+            'interrupted_during': assessment_phase,
+            'ocr_compat': compat_status,
+            'comparability_reasons': [f'interrupted during {assessment_phase}'],
+            'raw_output_dir': str(output_dir),
+        }
+        comparability, comparability_reasons = COMPARABILITY_UNKNOWN, [
+            f'interrupted during {assessment_phase}']
     except Exception:
         # B4: validation/diagnostics are part of the attempt lifecycle too.
         unexpected_error = traceback.format_exc()
@@ -489,12 +502,39 @@ def _pretty_name(dataset: str):
         return None
 
 
+def _identity_conflicts(manifest: dict, existing) -> list:
+    """Compare immutable run identity between the manifest and the DB row.
+
+    Moving an output directory is fine; rebinding a stored result to another
+    dataset/model/protocol/manifest is not.
+    """
+    fields = ('dataset', 'suite', 'model_id', 'model_config_identity',
+              'protocol_identity', 'sample_manifest_identity')
+    conflicts = []
+    existing_keys = set(existing.keys()) if hasattr(existing, 'keys') else set()
+    for field in fields:
+        new_value = manifest.get(field)
+        old_value = existing[field] if field in existing_keys else None
+        if new_value and old_value and str(new_value) != str(old_value):
+            conflicts.append(f'{field}: db={old_value} manifest={new_value}')
+    return conflicts
+
+
+def _write_audit(output_dir: Path, name: str, payload: dict, secrets) -> None:
+    try:
+        atomic_write_json(output_dir / name, redact(payload, secrets))
+    except Exception:  # noqa: BLE001 - audit is best effort
+        pass
+
+
 def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: Path) -> dict:
     """Re-parse an existing output directory without calling any model.
 
-    An import that would downgrade an already accepted run is rejected and
-    audited instead of silently deleting the previous metrics, and it never
-    rewrites the original evaluation completion time.
+    Parse and assessment run behind this boundary: failures are returned as a
+    redacted structured result (using secrets collected from the manifest)
+    instead of escaping as raw exception text.  An import that would rebind
+    results to another run identity, or downgrade an accepted run, is rejected
+    and audited; it never rewrites the original evaluation completion time.
     """
     output_dir = Path(output_dir)
     manifest = read_json(output_dir / 'run_manifest.json') if (output_dir / 'run_manifest.json').exists() else None
@@ -504,55 +544,83 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
     run_id = manifest['attempt_id']
     secrets = collect_secrets(manifest.get('task_config') or {})
 
-    report_path, report = locate_report(
-        output_dir, manifest['dataset'], manifest['report_id'], expected_pretty_name=None
-    )
-    metrics = metric_rows(report)
-    output_evidence = collect_output_evidence(
-        output_dir, manifest['dataset'], report_id=manifest.get('report_id')
-    )
-    raw_rows = manifest.get('sample_manifest') or _manifest_rows_from_details(
-        manifest.get('sample_manifest_detail') or {}
-    )
-    coverage_rows = apply_coverage(raw_rows, output_evidence)
-    manifest_identity = manifest.get('sample_manifest_identity') or (digest(raw_rows) if raw_rows else None)
-    outcome = assess_run(
-        report_error=None, metrics=metrics,
-        execution_summary=report.get('execution_summary'), manifest_rows=coverage_rows,
-    )
-    comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
-    diagnostics = summarize_diagnostics(output_evidence)
-    diagnostics['comparability_reasons'] = comparability_reasons
-    diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
-    diagnostics['imported'] = True
-
-    existing = store.get_attempt(run_id)
+    existing = None
     existing_metrics = None
-    if existing is not None:
-        existing_metrics = store.conn.execute(
-            'SELECT COUNT(*) AS n FROM metrics WHERE run_id=?', (run_id,)
-        ).fetchone()['n']
-    # Re-import must not pretend an old evaluation just finished.
-    finished_at = None
-    if existing is not None and existing['finished_at']:
-        finished_at = existing['finished_at']
-    elif manifest.get('created_at'):
-        finished_at = manifest['created_at']
+    try:
+        report_path, report = locate_report(
+            output_dir, manifest['dataset'], manifest['report_id'], expected_pretty_name=None
+        )
+        metrics = metric_rows(report)
+        output_evidence = collect_output_evidence(
+            output_dir, manifest['dataset'], report_id=manifest.get('report_id')
+        )
+        raw_rows = manifest.get('sample_manifest') or _manifest_rows_from_details(
+            manifest.get('sample_manifest_detail') or {}
+        )
+        coverage_rows = apply_coverage(raw_rows, output_evidence)
+        manifest_identity = manifest.get('sample_manifest_identity') or (digest(raw_rows) if raw_rows else None)
+        outcome = assess_run(
+            report_error=None, metrics=metrics,
+            execution_summary=report.get('execution_summary'), manifest_rows=coverage_rows,
+        )
+        comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
+        diagnostics = summarize_diagnostics(output_evidence)
+        diagnostics['comparability_reasons'] = comparability_reasons
+        diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
+        diagnostics['imported'] = True
 
-    outcome.update({
-        'phase': 'imported', 'finished_at': finished_at, 'imported_at': now_iso(),
-        'comparability': comparability,
-        'num_requested': (report.get('execution_summary') or {}).get('requested'),
-        'num_succeeded': (report.get('execution_summary') or {}).get('succeeded'),
-        'num_errored': (report.get('execution_summary') or {}).get('errored'),
-        'incomplete': bool((report.get('execution_summary') or {}).get('incomplete')),
-        'report_path': str(report_path), 'metrics': metrics, 'sample_manifest': coverage_rows,
-        'diagnostics': diagnostics, 'perf_metrics': report.get('perf_metrics'),
-        'primary_metric_identity': report.get('primary_metric_identity'),
-        'protocol_identity': manifest.get('protocol_identity'),
-        'sample_manifest_identity': manifest_identity,
-    })
-    safe_outcome = redact(outcome, secrets)
+        existing = store.get_attempt(run_id)
+        if existing is not None:
+            existing_metrics = store.conn.execute(
+                'SELECT COUNT(*) AS n FROM metrics WHERE run_id=?', (run_id,)
+            ).fetchone()['n']
+        # Re-import must not pretend an old evaluation just finished.
+        finished_at = None
+        if existing is not None and existing['finished_at']:
+            finished_at = existing['finished_at']
+        elif manifest.get('created_at'):
+            finished_at = manifest['created_at']
+
+        outcome.update({
+            'phase': 'imported', 'finished_at': finished_at, 'imported_at': now_iso(),
+            'comparability': comparability,
+            'num_requested': (report.get('execution_summary') or {}).get('requested'),
+            'num_succeeded': (report.get('execution_summary') or {}).get('succeeded'),
+            'num_errored': (report.get('execution_summary') or {}).get('errored'),
+            'incomplete': bool((report.get('execution_summary') or {}).get('incomplete')),
+            'report_path': str(report_path), 'metrics': metrics, 'sample_manifest': coverage_rows,
+            'diagnostics': diagnostics, 'perf_metrics': report.get('perf_metrics'),
+            'primary_metric_identity': report.get('primary_metric_identity'),
+            'protocol_identity': manifest.get('protocol_identity'),
+            'sample_manifest_identity': manifest_identity,
+        })
+        safe_outcome = redact(outcome, secrets)
+    except Exception as exc:  # noqa: BLE001 - parse failures are redacted at this boundary
+        return {
+            'run_id': run_id, 'status': 'failed', 'committed': False,
+            'evidence_file_updated': False,
+            'reason': redact_text(f'{exc.__class__.__name__}: {exc}', secrets),
+        }
+
+    conflicts = _identity_conflicts(manifest, existing) if existing is not None else []
+    if conflicts:
+        audit = {
+            'run_id': run_id, 'kind': 'identity_conflict', 'rejected_at': now_iso(),
+            'conflicts': conflicts,
+            'kept_validity_status': existing['validity_status'],
+            'kept_comparability': existing['comparability'],
+            'kept_metrics': existing_metrics,
+            'report_path': str(report_path),
+        }
+        _write_audit(output_dir, 'run_import_rejected.json', audit, secrets)
+        return {
+            'run_id': run_id, 'status': 'rejected', 'committed': False,
+            'reason': 'identity_conflict: ' + '; '.join(conflicts),
+            'conflicts': conflicts,
+            'validity_status': existing['validity_status'],
+            'comparability': existing['comparability'],
+            'metrics_kept': existing_metrics,
+        }
 
     accepted_existing = {'complete', 'partial'}
     existing_eligible = existing is not None and has_formal_eligibility(
@@ -576,7 +644,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'kept_metrics': existing_metrics,
             'report_path': str(report_path),
         }
-        atomic_write_json(output_dir / 'run_import_rejected.json', redact(audit, secrets))
+        _write_audit(output_dir, 'run_import_rejected.json', audit, secrets)
         return {
             'run_id': run_id, 'status': 'rejected', 'committed': False,
             'validity_status': existing['validity_status'],
@@ -600,8 +668,12 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         }
     try:
         if existing is None:
-            store.start_attempt(_manifest_attempt_record(entry, manifest, output_dir, repo_dir))
-        store.finish_attempt(run_id, safe_outcome)
+            # One transaction: a first import can never leave a `running` row.
+            store.create_attempt_with_outcome(
+                _manifest_attempt_record(entry, manifest, output_dir, repo_dir), safe_outcome
+            )
+        else:
+            store.finish_attempt(run_id, safe_outcome)
     except Exception as exc:  # noqa: BLE001
         return {
             'run_id': run_id, 'status': 'failed', 'committed': False,

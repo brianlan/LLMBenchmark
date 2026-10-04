@@ -451,3 +451,10 @@ def test_real_prediction_fixture_integration(tmp_path):
     assert len(evidence['subsets']['default']['reviewed']) == 5
     diagnostics = summarize_diagnostics(evidence)
     assert diagnostics['generation_calls'] == 5
+
+
+def test_duplicate_metric_identity_is_rejected():
+    metric = make_metric('accuracy')
+    report = make_report(metrics=[metric, dict(metric)], primary=None)
+    with pytest.raises(MetricParseError, match='duplicate metric identity'):
+        metric_rows(report)

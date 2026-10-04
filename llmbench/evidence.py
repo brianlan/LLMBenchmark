@@ -300,15 +300,16 @@ def _numeric(value, where: str):
     if isinstance(value, (int, float)):
         result = float(value)
         if not math.isfinite(result):
-            raise MetricParseError(f'{where}: non-finite score {value!r}')
+            raise MetricParseError(f'{where}: non-finite score')
         return result
     if isinstance(value, str):
         try:
             result = float(value)
         except ValueError as exc:
-            raise MetricParseError(f'{where}: non-numeric score {value!r}') from exc
+            # Never echo the value: upstream content can contain credentials.
+            raise MetricParseError(f'{where}: non-numeric score (str)') from exc
         if not math.isfinite(result):
-            raise MetricParseError(f'{where}: non-finite score {value!r}')
+            raise MetricParseError(f'{where}: non-finite score')
         return result
     raise MetricParseError(f'{where}: unsupported score type {type(value).__name__}')
 
@@ -331,6 +332,19 @@ def primary_metric_key(report: dict) -> str | None:
     if not identity:
         return None
     return metric_identity(identity)[0]
+
+
+def ensure_unique_metric_keys(rows: list[dict]) -> None:
+    """Reject duplicate (metric, category, subset) identities before persistence."""
+    seen = set()
+    for row in rows:
+        key = (row.get('metric_key'), row.get('category_key'), row.get('subset'))
+        if key in seen:
+            raise MetricParseError(
+                f"duplicate metric identity: {row.get('metric_name')} "
+                f"(category={row.get('category')}, subset={row.get('subset')!r})"
+            )
+        seen.add(key)
 
 
 def metric_rows(report: dict) -> list[dict]:
@@ -380,6 +394,7 @@ def metric_rows(report: dict) -> list[dict]:
                     'macro_score': None,
                     'num': subset.get('num'),
                 })
+    ensure_unique_metric_keys(rows)
     return rows
 
 

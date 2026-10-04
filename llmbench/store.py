@@ -267,7 +267,25 @@ class Store:
     def finish_attempt(self, run_id: str, outcome: dict) -> None:
         """Atomically replace the attempt's metrics/manifest and write its final state."""
         with self.transaction():
+            self._write_outcome(run_id, outcome)
+
+    def create_attempt_with_outcome(self, record: dict, outcome: dict) -> None:
+        """Create a new attempt and write its final state in one transaction.
+
+        A failure here rolls back both the run row and the outcome, so a first
+        import can never leave a `running` record behind.
+        """
+        columns = [c for c in RUN_INSERT_COLUMNS if c in record]
+        placeholders = ', '.join('?' for _ in columns)
+        values = [record[c] for c in columns]
+        with self.transaction():
             self.conn.execute(
+                f"INSERT INTO runs ({', '.join(columns)}) VALUES ({placeholders})", values
+            )
+            self._write_outcome(record['run_id'], outcome)
+
+    def _write_outcome(self, run_id: str, outcome: dict) -> None:
+        self.conn.execute(
                 """UPDATE runs SET execution_status=?, validity_status=?, status_reason=?,
                        phase=?, comparability=?, finished_at=COALESCE(?, finished_at),
                        num_requested=?, num_succeeded=?,
@@ -287,25 +305,25 @@ class Store:
                  _dumps(outcome.get('primary_metric_identity')),
                  outcome.get('imported_at'),
                  run_id),
-            )
-            self.conn.execute('DELETE FROM metrics WHERE run_id=?', (run_id,))
-            self.conn.executemany(
-                """INSERT INTO metrics (run_id, metric_key, metric_name, aggregation, dimensions_json,
-                       category_key, category_json, subset, num, score, macro_score, semantics_kind,
-                       display_kind, direction, unit, is_primary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [_metric_values(run_id, row) for row in outcome.get('metrics') or []],
-            )
-            self.conn.execute('DELETE FROM sample_manifest WHERE run_id=?', (run_id,))
-            self.conn.executemany(
-                """INSERT INTO sample_manifest (run_id, subset, selected, predicted, reviewed,
-                       sample_ids_json, question_digest, media_digest, input_digest, media_evidence,
-                       predicted_missing_json, predicted_extra_json, predicted_duplicates,
-                       reviewed_missing_json, reviewed_extra_json, reviewed_duplicates,
-                       evidence_scoped)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [_manifest_values(run_id, row) for row in outcome.get('sample_manifest') or []],
-            )
+        )
+        self.conn.execute('DELETE FROM metrics WHERE run_id=?', (run_id,))
+        self.conn.executemany(
+            """INSERT INTO metrics (run_id, metric_key, metric_name, aggregation, dimensions_json,
+                   category_key, category_json, subset, num, score, macro_score, semantics_kind,
+                   display_kind, direction, unit, is_primary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [_metric_values(run_id, row) for row in outcome.get('metrics') or []],
+        )
+        self.conn.execute('DELETE FROM sample_manifest WHERE run_id=?', (run_id,))
+        self.conn.executemany(
+            """INSERT INTO sample_manifest (run_id, subset, selected, predicted, reviewed,
+                   sample_ids_json, question_digest, media_digest, input_digest, media_evidence,
+                   predicted_missing_json, predicted_extra_json, predicted_duplicates,
+                   reviewed_missing_json, reviewed_extra_json, reviewed_duplicates,
+                   evidence_scoped)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [_manifest_values(run_id, row) for row in outcome.get('sample_manifest') or []],
+        )
 
     # -- reads --------------------------------------------------------------
 

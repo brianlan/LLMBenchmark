@@ -186,3 +186,24 @@ def test_concurrent_writers_do_not_lock(tmp_path):
     assert errors == []
     assert first.conn.execute('SELECT COUNT(*) AS n FROM runs').fetchone()['n'] == 3
     first.close()
+
+
+def test_create_attempt_with_outcome_rolls_back_on_failure(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    with pytest.raises(KeyError):
+        store.create_attempt_with_outcome(attempt_record('run-atomic'),
+                                          {'metrics': [{'metric_key': 'k'}]})
+    assert store.attempt_exists('run-atomic') is False
+    assert store.conn.execute(
+        "SELECT COUNT(*) AS n FROM runs WHERE execution_status='running'").fetchone()['n'] == 0
+    store.close()
+
+
+def test_create_attempt_with_outcome_writes_single_row(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    store.create_attempt_with_outcome(attempt_record('run-ok'), outcome(0.4))
+    row = store.get_attempt('run-ok')
+    assert row['execution_status'] == 'completed'
+    assert row['finished_at'] == '2026-01-01T00:01:00'
+    assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == 1
+    store.close()
