@@ -44,6 +44,7 @@ from .validation import (
     VALID,
     assess_comparability,
     assess_run,
+    has_formal_eligibility,
 )
 
 
@@ -340,28 +341,48 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
         unexpected_error = traceback.format_exc()
 
     manifest_rows = manifest.get('sample_manifest') or []
-    coverage_rows = apply_coverage(manifest_rows, output_evidence)
-    if interrupted:
-        outcome = assess_run(interrupted=True)
-    elif unexpected_error:
-        outcome = assess_run(task_error=f'[{phase}] {unexpected_error}')
-    else:
-        outcome = assess_run(
-            report_error=report_error, metrics=metrics,
-            execution_summary=(report or {}).get('execution_summary'),
-            manifest_rows=coverage_rows,
-        )
-    comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
-    if comparability_reasons and outcome['validity_status'] == VALID and comparability != 'verified':
-        outcome['status_reason'] = (outcome['status_reason'] + '; ' if outcome['status_reason'] else '') \
-            + 'comparability: ' + '; '.join(comparability_reasons)
-
-    diagnostics = summarize_diagnostics(output_evidence)
-    diagnostics['ocr_compat'] = compat_status
-    diagnostics['comparability_reasons'] = comparability_reasons
-    diagnostics['raw_output_dir'] = str(output_dir)
+    coverage_rows = []
+    comparability, comparability_reasons = COMPARABILITY_UNKNOWN, ['assessment did not run']
+    diagnostics = {}
+    assessment_phase = 'assessment'
+    try:
+        coverage_rows = apply_coverage(manifest_rows, output_evidence)
+        if interrupted:
+            outcome = assess_run(interrupted=True)
+        elif unexpected_error:
+            outcome = assess_run(task_error=f'[{phase}] {unexpected_error}')
+        else:
+            outcome = assess_run(
+                report_error=report_error, metrics=metrics,
+                execution_summary=(report or {}).get('execution_summary'),
+                manifest_rows=coverage_rows,
+            )
+        assessment_phase = 'comparability'
+        comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
+        if comparability_reasons and outcome['validity_status'] == VALID and comparability != 'verified':
+            outcome['status_reason'] = (outcome['status_reason'] + '; ' if outcome['status_reason'] else '') \
+                + 'comparability: ' + '; '.join(comparability_reasons)
+        assessment_phase = 'diagnostics'
+        diagnostics = summarize_diagnostics(output_evidence)
+        diagnostics['ocr_compat'] = compat_status
+        diagnostics['comparability_reasons'] = comparability_reasons
+        diagnostics['raw_output_dir'] = str(output_dir)
+        diagnostics['repeat_policy'] = 'review keys are matched against prediction keys'
+    except Exception:
+        # B4: validation/diagnostics are part of the attempt lifecycle too.
+        unexpected_error = traceback.format_exc()
+        outcome = assess_run(task_error=f'[{assessment_phase}] {unexpected_error}')
+        diagnostics = {
+            'attempt_error_phase': assessment_phase,
+            'assessment_error': redact_text(unexpected_error, secrets),
+            'ocr_compat': compat_status,
+            'comparability_reasons': [f'assessment failed in phase {assessment_phase}'],
+            'raw_output_dir': str(output_dir),
+        }
+        comparability, comparability_reasons = COMPARABILITY_UNKNOWN, [
+            f'assessment failed in phase {assessment_phase}']
     if unexpected_error:
-        diagnostics['attempt_error_phase'] = phase
+        diagnostics.setdefault('attempt_error_phase', phase)
         if phase == 'diagnostics':
             diagnostics['diagnostics_error'] = redact_text(unexpected_error, secrets)
 
@@ -518,14 +539,24 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
     safe_outcome = redact(outcome, secrets)
 
     accepted_existing = {'complete', 'partial'}
-    if existing is not None and existing['validity_status'] in accepted_existing \
-            and safe_outcome['validity_status'] != 'complete':
+    existing_eligible = existing is not None and has_formal_eligibility(
+        existing['validity_status'], existing['comparability'])
+    new_eligible = has_formal_eligibility(
+        safe_outcome['validity_status'], safe_outcome['comparability'])
+    downgraded = existing is not None and (
+        (existing['validity_status'] in accepted_existing
+         and safe_outcome['validity_status'] != 'complete')
+        or (existing_eligible and not new_eligible)
+    )
+    if downgraded:
         audit = {
             'run_id': run_id,
             'rejected_at': now_iso(),
             'reason': safe_outcome['status_reason'],
             'new_validity_status': safe_outcome['validity_status'],
+            'new_comparability': safe_outcome['comparability'],
             'kept_validity_status': existing['validity_status'],
+            'kept_comparability': existing['comparability'],
             'kept_metrics': existing_metrics,
             'report_path': str(report_path),
         }
@@ -533,15 +564,35 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         return {
             'run_id': run_id, 'status': 'rejected', 'committed': False,
             'validity_status': existing['validity_status'],
+            'comparability': existing['comparability'],
             'new_validity_status': safe_outcome['validity_status'],
+            'new_comparability': safe_outcome['comparability'],
             'reason': safe_outcome['status_reason'],
             'metrics_kept': existing_metrics,
         }
 
-    if existing is None:
-        store.start_attempt(_manifest_attempt_record(entry, manifest, output_dir, repo_dir))
-    store.finish_attempt(run_id, safe_outcome)
-    atomic_write_json(output_dir / 'run_outcome.json', safe_outcome)
+    # Write the evidence file before committing: if it fails, the database still
+    # holds the previous state and the CLI can say so truthfully.
+    try:
+        atomic_write_json(output_dir / 'run_outcome.json', safe_outcome)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            'run_id': run_id, 'status': 'failed', 'committed': False,
+            'evidence_file_updated': False,
+            'reason': redact_text(
+                f'evidence_write_error: {exc.__class__.__name__}: {exc}', secrets),
+        }
+    try:
+        if existing is None:
+            store.start_attempt(_manifest_attempt_record(entry, manifest, output_dir, repo_dir))
+        store.finish_attempt(run_id, safe_outcome)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            'run_id': run_id, 'status': 'failed', 'committed': False,
+            'evidence_file_updated': True,
+            'reason': redact_text(
+                f'database_error: {exc.__class__.__name__}: {exc}', secrets),
+        }
     return {
         'run_id': run_id, 'status': 'committed', 'committed': True,
         'validity_status': safe_outcome['validity_status'],
@@ -631,6 +682,15 @@ def run_plan(plan, *, store: Store, repo_dir: Path, dry_run: bool = False) -> li
                 raise
             except Exception:  # noqa: BLE001 - never let one attempt kill the batch
                 detail = redact_text(traceback.format_exc(), collect_secrets(entry.model_cfg))
+                try:
+                    # The attempt record may already be running; close it explicitly.
+                    store.finish_attempt(attempt_id, {
+                        'execution_status': 'failed', 'validity_status': 'invalid',
+                        'status_reason': f'runner_error: {detail}', 'phase': 'runner',
+                        'finished_at': now_iso(), 'comparability': COMPARABILITY_UNKNOWN,
+                    })
+                except Exception:  # noqa: BLE001 - DB may be unavailable; report the state we know
+                    pass
                 results.append(AttemptResult(attempt_id, output_dir, 'failed', 'invalid',
                                              f'runner_error: {detail}', persisted=False,
                                              error=detail))

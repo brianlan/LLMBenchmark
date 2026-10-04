@@ -43,6 +43,7 @@ SUITES = {
                 'swe_bench_pro': {'core': False, 'requires_sandbox': True},
                 'swe_bench_verified_agentic': {
                     'core': True, 'pinned': True, 'requires_sandbox': True,
+                    'pinned_instance_id': 'django__django-10097',
                     'local_path': '${DATA_ROOT}/pinned/ds',
                 },
             },
@@ -84,6 +85,7 @@ def test_pinned_limit_is_one(tmp_path):
     pinned = [entry for entry in entries if entry.dataset == 'swe_bench_verified_agentic'][0]
     assert pinned.limit == 1
     assert pinned.local_path == tmp_path / 'pinned' / 'ds'
+    assert pinned.pinned_instance == 'django__django-10097'
 
 
 def test_explicit_datasets_override_core_filter(tmp_path):
@@ -163,6 +165,41 @@ def test_protocol_identity_axes():
         'gpqa_diamond': {'extra_params': {'x': 1}}}})
 
 
+def test_preflight_rejects_pinned_parquet_with_wrong_instance(tmp_path, monkeypatch):
+    pyarrow = pytest.importorskip('pyarrow')
+    import hashlib
+    import json as json_module
+    import pyarrow.parquet as pq
+
+    pinned = tmp_path / 'pinned' / 'ds'
+    pinned.mkdir(parents=True)
+    parquet = pinned / 'test-00000-of-00001.parquet'
+    pq.write_table(pyarrow.table({'instance_id': ['wrong-instance']}), parquet)
+    sha = hashlib.sha256(parquet.read_bytes()).hexdigest()
+    (pinned / 'source.json').write_text(json_module.dumps({
+        'instance_ids': ['django__django-10097'], 'revision': 'a' * 40, 'parquet_sha256': sha,
+    }))
+
+    entry = PlanEntry(
+        model_alias='minimax', model_cfg=MODELS['minimax'], suite='swe',
+        dataset='swe_bench_verified_agentic', spec={}, profile='smoke', limit=1,
+        batch_size=1, pinned=True, local_path=pinned, status='tested',
+        pinned_instance='django__django-10097',
+    )
+    errors = check_entry_requirements(entry, check_keys=False, check_docker=False, check_pinned=True)
+    assert any('instance_id' in error for error in errors)
+
+
+def test_preflight_requires_pinned_instance_id_in_config(tmp_path):
+    entry = PlanEntry(
+        model_alias='minimax', model_cfg=MODELS['minimax'], suite='swe',
+        dataset='swe_bench_verified_agentic', spec={}, profile='smoke', limit=1,
+        batch_size=1, pinned=True, local_path=tmp_path / 'pinned', status='tested',
+    )
+    errors = check_entry_requirements(entry, check_keys=False, check_docker=False, check_pinned=True)
+    assert any('pinned_instance_id' in error for error in errors)
+
+
 def test_suite_sandbox_policy_is_inherited_and_satisfied(tmp_path, monkeypatch):
     entries = plan(tmp_path, suite_names=['swe'], include_extensions=False).entries
     sandbox_entry = [entry for entry in entries if entry.dataset == 'live_code_bench'][0]
@@ -213,6 +250,7 @@ def test_preflight_rejects_pinned_parquet_that_is_not_readable(tmp_path, monkeyp
         model_alias='minimax', model_cfg=MODELS['minimax'], suite='swe',
         dataset='swe_bench_verified_agentic', spec={}, profile='smoke', limit=1,
         batch_size=1, pinned=True, local_path=pinned, status='tested',
+        pinned_instance='django__django-10097',
     )
     errors = check_entry_requirements(entry, check_keys=False, check_docker=False, check_pinned=True)
     assert any('parquet' in error or 'pyarrow' in error for error in errors)

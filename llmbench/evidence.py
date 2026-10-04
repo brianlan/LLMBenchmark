@@ -314,13 +314,16 @@ def _numeric(value, where: str):
 
 
 def metric_identity(identity: dict):
-    identity = identity or {}
+    identity = identity if isinstance(identity, dict) else {}
+    name = identity.get('name')
     payload = {
-        'name': identity.get('name'),
+        'name': name,
         'aggregation': identity.get('aggregation'),
         'dimensions': identity.get('dimensions') or {},
     }
-    return digest(payload), payload
+    # A hash can always be computed; validity requires the report to declare a name.
+    identity_valid = isinstance(name, str) and name.strip() != ''
+    return digest(payload), {**payload, 'identity_valid': identity_valid}
 
 
 def primary_metric_key(report: dict) -> str | None:
@@ -341,6 +344,7 @@ def metric_rows(report: dict) -> list[dict]:
         base = {
             'metric_key': key,
             'metric_name': identity['name'] or metric.get('legacy_name') or 'metric',
+            'identity_valid': identity.get('identity_valid', True),
             'aggregation': identity['aggregation'],
             'dimensions': identity['dimensions'],
             'semantics_kind': semantics.get('kind'),
@@ -514,53 +518,55 @@ def collect_output_evidence(output_dir: Path, dataset: str, *, report_id: str | 
     return result
 
 
-def _coverage_diff(expected: list, observed: list) -> dict:
-    """Compare expected sample IDs with observed evidence keys.
+def _base_key(key: str) -> str:
+    return key.rsplit('#r', 1)[0]
 
-    Observed keys carry a repeat id (``<sample>#r<n>``); multiple legitimate
-    repeats count as coverage, while the same (sample, repeat) key twice counts
-    as a duplicate.
-    """
-    expected_set = set(expected)
-    observed_bases = {key.rsplit('#r', 1)[0] for key in observed}
-    if expected_set:
-        missing = sorted(expected_set - observed_bases)
-        extra = sorted(observed_bases - expected_set)
-        covered = len(expected_set & observed_bases)
-    else:
-        missing, extra, covered = [], sorted(observed_bases), len(observed_bases)
-    occurrences = Counter(observed)
-    return {
-        'covered': covered,
-        'total': len(observed),
-        'missing': missing,
-        'extra': extra,
-        'duplicates': sum(count - 1 for count in occurrences.values() if count > 1),
-    }
+
+def _duplicate_count(keys: list) -> int:
+    occurrences = Counter(keys)
+    return sum(count - 1 for count in occurrences.values() if count > 1)
 
 
 def apply_coverage(manifest_rows: list[dict], output_evidence: dict) -> list[dict]:
-    """Merge coverage into sample_manifest rows, keeping the ID-set differences."""
+    """Merge coverage into sample_manifest rows.
+
+    ``predicted_*`` compares predicted evidence keys against the manifest's
+    selected sample IDs (the manifest has no repeat plan, so any observed repeat
+    is accepted as long as it covers the selected base IDs).  ``reviewed_*``
+    compares review keys against the **prediction keys**, not just the base IDs:
+    a review of repeat 1 cannot certify that repeat 0 was scored.
+    """
     subsets = (output_evidence or {}).get('subsets') or {}
     merged = []
     for row in manifest_rows:
         subset = row['subset']
         coverage = subsets.get(subset, {})
         expected = [str(item) for item in (row.get('sample_ids') or [])]
-        predicted = _coverage_diff(expected, [str(item) for item in coverage.get('predicted') or []])
-        reviewed = _coverage_diff(expected, [str(item) for item in coverage.get('reviewed') or []])
+        predicted_keys = [str(item) for item in coverage.get('predicted') or []]
+        reviewed_keys = [str(item) for item in coverage.get('reviewed') or []]
+        expected_set = set(expected)
+        predicted_bases = {_base_key(key) for key in predicted_keys}
+        if expected_set:
+            predicted_missing = sorted(expected_set - predicted_bases)
+            predicted_extra = sorted(predicted_bases - expected_set)
+            predicted_covered = len(expected_set & predicted_bases)
+        else:
+            predicted_missing, predicted_extra = [], sorted(predicted_bases)
+            predicted_covered = len(predicted_bases)
+        reviewed_missing = sorted(set(predicted_keys) - set(reviewed_keys))
+        reviewed_extra = sorted(set(reviewed_keys) - set(predicted_keys))
         merged.append({
             **row,
-            'predicted': predicted['covered'],
-            'predicted_total': predicted['total'],
-            'predicted_missing': predicted['missing'],
-            'predicted_extra': predicted['extra'],
-            'predicted_duplicates': predicted['duplicates'],
-            'reviewed': reviewed['covered'],
-            'reviewed_total': reviewed['total'],
-            'reviewed_missing': reviewed['missing'],
-            'reviewed_extra': reviewed['extra'],
-            'reviewed_duplicates': reviewed['duplicates'],
+            'predicted': predicted_covered,
+            'predicted_total': len(predicted_keys),
+            'predicted_missing': predicted_missing,
+            'predicted_extra': predicted_extra,
+            'predicted_duplicates': _duplicate_count(predicted_keys),
+            'reviewed': len(set(predicted_keys) & set(reviewed_keys)),
+            'reviewed_total': len(reviewed_keys),
+            'reviewed_missing': reviewed_missing,
+            'reviewed_extra': reviewed_extra,
+            'reviewed_duplicates': _duplicate_count(reviewed_keys),
         })
     return merged
 

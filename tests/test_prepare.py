@@ -161,3 +161,23 @@ def test_validate_pinned_content_verifies_readability_and_instance(tmp_path):
     pq.write_table(pa.table({'instance_id': [DJANGO_INSTANCE_ID]}), parquet)
     ok, reason = validate_pinned_content(root, DJANGO_INSTANCE_ID)
     assert ok and reason == 'content verified'
+
+
+def test_validate_pinned_content_requires_expected_instance(tmp_path):
+    pytest.importorskip('pyarrow')
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = tmp_path / 'pinned'
+    root.mkdir()
+    parquet = root / 'test-00000-of-00001.parquet'
+
+    pq.write_table(pa.table({'not_instance': ['x']}), parquet)
+    ok, reason = validate_pinned_content(root, DJANGO_INSTANCE_ID)
+    assert not ok and 'instance_id column' in reason
+
+    pq.write_table(pa.table({'instance_id': [DJANGO_INSTANCE_ID]}), parquet)
+    ok, reason = validate_pinned_content(root)
+    assert not ok and 'expected instance id' in reason
+    ok, reason = validate_pinned_content(root, DJANGO_INSTANCE_ID)
+    assert ok

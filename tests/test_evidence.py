@@ -325,7 +325,7 @@ def test_disjoint_ids_are_not_verified(tmp_path):
     from llmbench.validation import assess_comparability, COMPARABILITY_UNKNOWN
     status, reasons = assess_comparability(rows, evidence)
     assert status == COMPARABILITY_UNKNOWN
-    assert any('missing ids' in reason for reason in reasons)
+    assert any('missing evidence keys' in reason for reason in reasons)
 
 
 def test_other_model_directory_is_not_this_attempts_evidence(tmp_path):
@@ -367,6 +367,61 @@ def test_repeat_ids_are_not_duplicates(tmp_path):
     rows = apply_coverage(_manifest_for_evidence(sample_ids=('0',)), evidence)
     assert rows[0]['predicted'] == 1
     assert rows[0]['predicted_duplicates'] == 0
+
+
+def _write_repeat_evidence(out, predicted_repeats, reviewed_repeats):
+    for folder, repeats in (('predictions', predicted_repeats), ('reviews', reviewed_repeats)):
+        root = out / folder / MODEL
+        root.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({'index': 0, 'repeat_id': repeat, 'model_output': {
+            'choices': [{'stop_reason': 'stop'}], 'usage': {}}}) for repeat in repeats]
+        (root / 'gpqa_diamond_default.jsonl').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def test_review_of_another_repeat_is_not_verified(tmp_path):
+    # prediction repeat 0, review repeat 1: same base sample, different execution
+    out = tmp_path / 'attempt'
+    _write_repeat_evidence(out, [0], [1])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(sample_ids=('0',)), evidence)
+    assert rows[0]['reviewed_missing'] == ['0#r0']
+    assert rows[0]['reviewed_extra'] == ['0#r1']
+    from llmbench.validation import assess_comparability, COMPARABILITY_UNKNOWN
+    status, _ = assess_comparability(rows, evidence)
+    assert status == COMPARABILITY_UNKNOWN
+
+
+def test_predicted_repeat_without_review_is_not_verified(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_repeat_evidence(out, [0, 1], [0])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(sample_ids=('0',)), evidence)
+    assert rows[0]['reviewed_missing'] == ['0#r1']
+    from llmbench.validation import assess_comparability, COMPARABILITY_UNKNOWN
+    status, _ = assess_comparability(rows, evidence)
+    assert status == COMPARABILITY_UNKNOWN
+
+
+def test_matching_repeats_are_verified(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_repeat_evidence(out, [0, 1], [0, 1])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(sample_ids=('0',)), evidence)
+    assert rows[0]['reviewed_missing'] == [] and rows[0]['reviewed_extra'] == []
+    assert rows[0]['reviewed'] == 2
+    from llmbench.validation import assess_comparability, COMPARABILITY_VERIFIED
+    status, _ = assess_comparability(rows, evidence)
+    assert status == COMPARABILITY_VERIFIED
+
+
+def test_report_identity_without_name_is_marked_invalid():
+    report = make_report(metrics=[make_metric('accuracy')], primary=
+                         {'aggregation': 'mean'})
+    report['metrics'][0]['identity'] = {'aggregation': 'mean', 'dimensions': {}}
+    rows = [row for row in metric_rows(report) if not row['category']]
+    assert rows[0]['is_primary'] is True  # hash matched the declared primary
+    assert rows[0]['identity_valid'] is False
+    assert rows[0]['metric_name'] == 'metric'
 
 
 def test_malformed_jsonl_lines_are_reported_not_hidden(tmp_path):

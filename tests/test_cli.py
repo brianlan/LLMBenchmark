@@ -2,11 +2,13 @@ import json
 from pathlib import Path
 
 from llmbench.cli import main
+from llmbench.runner import AttemptResult
 from llmbench.store import Store
 from llmbench.summary import TOP_CATEGORY_KEY
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIGS = str(REPO / 'configs')
+SENTINEL = 'sk-review-SENTINEL-not-a-real-key'
 
 
 def test_dry_run_has_zero_side_effects(tmp_path, monkeypatch, capsys):
@@ -131,8 +133,6 @@ def test_rejected_import_exits_1(tmp_path, monkeypatch, capsys):
 
 
 def test_summary_write_failure_returns_exit_1(tmp_path, monkeypatch, capsys):
-    from llmbench.runner import AttemptResult
-
     monkeypatch.setenv('MINIMAX_API_KEY', 'test-key')
     monkeypatch.setattr('llmbench.cli._preflight_errors', lambda plan, data_root: [])
     monkeypatch.setattr('llmbench.cli.resolve_task_config', lambda raw: {})
@@ -149,3 +149,81 @@ def test_summary_write_failure_returns_exit_1(tmp_path, monkeypatch, capsys):
     ])
     assert exit_code == 1
     assert 'summary generation failed' in capsys.readouterr().err
+
+
+def _write_bad_score_attempt(root):
+    report_id = 'MiniMax-X'
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'run_manifest.json').write_text(json.dumps({
+        'attempt_id': 'imp-1', 'dataset': 'gpqa_diamond', 'report_id': report_id,
+        'model_id': report_id, 'model_alias': 'minimax', 'suite': 'knowledge',
+        'profile': 'lite', 'protocol_identity': 'p', 'task_config': {},
+    }), encoding='utf-8')
+    report_dir = root / 'reports' / report_id
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / 'gpqa_diamond.json').write_text(json.dumps({
+        'dataset_name': 'gpqa_diamond', 'model_name': report_id,
+        'metrics': [{
+            'identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+            'score': SENTINEL, 'num': 1, 'categories': [],
+            'semantics': {'kind': 'quality'},
+        }],
+        'primary_metric_identity': {'name': 'accuracy', 'aggregation': 'mean', 'dimensions': {}},
+        'execution_summary': {'requested': 1, 'succeeded': 1, 'errored': 0, 'incomplete': False},
+    }), encoding='utf-8')
+
+
+def test_import_parse_error_does_not_leak_secret(tmp_path, capsys):
+    attempt = tmp_path / 'attempt'
+    _write_bad_score_attempt(attempt)
+    exit_code = main([
+        'import', '--output-dir', str(attempt), '--data-root', str(tmp_path),
+        '--db', str(tmp_path / 'results.db'),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert 'import failed' in captured.err
+    assert SENTINEL not in captured.err
+    assert SENTINEL not in captured.out
+
+
+def test_cleanup_images_receives_attempt_start_times(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setenv('MINIMAX_API_KEY', 'test-key')
+    monkeypatch.setattr('llmbench.cli._preflight_errors', lambda plan, data_root: [])
+    monkeypatch.setattr('llmbench.cli.resolve_task_config', lambda raw: {})
+    ok = AttemptResult('r1', tmp_path / 'out', 'completed', 'complete', 'complete', True)
+    monkeypatch.setattr('llmbench.cli.run_plan', lambda plan, store, repo_dir: [ok])
+    monkeypatch.setattr('llmbench.cli.collect_owned_candidates', lambda dirs: {
+        'swebench/a:latest': '2026-01-01T00:00:00+00:00'})
+
+    def fake_cleanup(images, **kwargs):
+        captured['images'] = images
+        captured['created_after'] = kwargs.get('created_after')
+        return {'removed': [], 'kept': sorted(images), 'unproven': {}, 'failed': [],
+                'requested': [], 'available': [], 'in_use': [], 'owned': []}
+
+    monkeypatch.setattr('llmbench.cli.cleanup_owned_images', fake_cleanup)
+    monkeypatch.setattr('llmbench.cli.write_summary', lambda *args, **kwargs: tmp_path / 's.md')
+
+    exit_code = main([
+        'run', '--suite', 'knowledge', '--profile', 'smoke', '--datasets', 'gpqa_diamond',
+        '--cleanup-images', '--data-root', str(tmp_path), '--config-dir', CONFIGS,
+    ])
+    assert exit_code == 0
+    assert captured['images'] == {'swebench/a:latest'}
+    assert captured['created_after'] == {'swebench/a:latest': '2026-01-01T00:00:00+00:00'}
+
+
+def test_import_evidence_failure_message_is_accurate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr('llmbench.cli.import_output', lambda *a, **k: {
+        'status': 'failed', 'committed': False, 'evidence_file_updated': True,
+        'reason': 'database_error: database is read-only'})
+    exit_code = main([
+        'import', '--output-dir', str(tmp_path), '--data-root', str(tmp_path),
+        '--db', str(tmp_path / 'results.db'),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert 'database was NOT committed' in captured.err
+    assert 'left untouched' not in captured.err

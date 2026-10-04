@@ -128,3 +128,16 @@ def test_unrelated_images_are_never_touched():
     )
     assert report['removed'] == ['swebench/owned:latest']
     assert removed == ['swebench/owned:latest']
+
+
+def test_candidate_mapping_is_accepted_directly():
+    removed = []
+    report = cleanup_owned_images(
+        {'swebench/a:latest': '2026-01-02T00:00:00+00:00'},
+        image_created=lambda image: '2026-01-02T00:10:00+00:00',
+        image_lister=lambda: ['swebench/a:latest'],
+        container_lister=lambda: [],
+        remover=removed.extend,
+    )
+    assert report['removed'] == ['swebench/a:latest']
+    assert removed == ['swebench/a:latest']

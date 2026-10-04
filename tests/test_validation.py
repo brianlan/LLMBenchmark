@@ -152,6 +152,36 @@ def test_invalid_primary_identity_is_invalid():
     assert 'primary_metric_invalid_identity' in result['status_reason']
 
 
+def test_fallback_metric_name_does_not_count_as_identity():
+    metric = quality_metric()
+    metric['identity_valid'] = False
+    result = assess_run(metrics=[metric], execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == INVALID
+    assert 'primary_metric_invalid_identity' in result['status_reason']
+
+
+def test_non_integer_execution_counts_are_unverified_not_crash():
+    result = assess_run(metrics=[quality_metric()],
+                        execution_summary={'requested': '5', 'succeeded': 5, 'errored': 0})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'invalid_execution_summary' in result['status_reason']
+
+    result = assess_run(metrics=[quality_metric()],
+                        execution_summary={'requested': 5, 'succeeded': '5', 'errored': 0})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'invalid_execution_summary' in result['status_reason']
+
+    result = assess_run(metrics=[quality_metric()], execution_summary=['not', 'a', 'dict'])
+    assert result['validity_status'] == UNVERIFIED
+    assert 'invalid_execution_summary' in result['status_reason']
+
+    result = assess_run(metrics=[quality_metric()],
+                        execution_summary={'requested': 5, 'succeeded': 5,
+                                           'incomplete': 'false'})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'invalid_execution_summary' in result['status_reason']
+
+
 def test_comparability_verified_and_unknown():
     verified_row = manifest_row()
     verified_row.update({'predicted_missing': [], 'predicted_extra': [], 'predicted_duplicates': 0,
@@ -162,7 +192,7 @@ def test_comparability_verified_and_unknown():
 
     status, reasons = assess_comparability([{**verified_row, 'reviewed_missing': ['3']}], evidence)
     assert status == COMPARABILITY_UNKNOWN
-    assert any('missing ids' in reason for reason in reasons)
+    assert any('missing evidence keys' in reason for reason in reasons)
 
     status, reasons = assess_comparability([verified_row], {'subsets': {}, 'malformed_lines': [{}]})
     assert status == COMPARABILITY_UNKNOWN

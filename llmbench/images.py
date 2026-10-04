@@ -113,6 +113,10 @@ def _docker_image_created(image: str) -> str | None:
 def cleanup_owned_images(images, *, created_after=None, image_created=None,
                          image_lister=None, container_lister=None, remover=None) -> dict:
     """Remove only images proven created by this run and unused by any container."""
+    if created_after is None and isinstance(images, dict):
+        # ``collect_owned_candidates()`` already carries image -> attempt start.
+        created_after = dict(images)
+    images = set(images)
     image_lister = image_lister or (lambda: _docker_output(
         ['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}']))
     container_lister = container_lister or (lambda: _docker_output(

@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import types
 from contextlib import contextmanager
@@ -497,3 +498,100 @@ def test_c1_generation_config_is_deep_merged(tmp_path):
                                        output_dir=tmp_path / 'out', api_key='k')
     assert raw['generation_config'] == {'max_tokens': 100, 'extra_body': {'reasoning': True, 'top_p': 0.5}}
     assert raw['dataset_args']['gpqa_diamond']['extra_params'] == {'build_docker_images': True, 'nested': {'a': 1}}
+
+
+def test_b4_malformed_execution_summary_terminates_and_continues(tmp_path, monkeypatch):
+    def run_task(cfg):
+        dataset = cfg['datasets'][0]
+        execution = ({'requested': '5', 'succeeded': 5, 'errored': 0, 'incomplete': False}
+                     if dataset == 'gpqa_diamond' else
+                     {'requested': 5, 'succeeded': 5, 'errored': 0, 'incomplete': False})
+        write_report(Path(cfg['work_dir']), dataset=dataset, execution=execution)
+        write_jsonl(Path(cfg['work_dir']), 'predictions', dataset=dataset)
+        write_jsonl(Path(cfg['work_dir']), 'reviews', dataset=dataset)
+
+    stub_evalscope(monkeypatch, run_task)
+    plan = Plan(data_root=tmp_path, profile='lite', entries=[entry('gpqa_diamond'), entry('math_500')])
+    store = Store(tmp_path / 'results.db')
+    results = runner.run_plan(plan, store=store, repo_dir=tmp_path)
+
+    assert len(results) == 2
+    assert results[0].validity_status == 'unverified'
+    assert 'invalid_execution_summary' in results[0].status_reason
+    assert results[1].validity_status == 'complete'
+    assert store.conn.execute("SELECT COUNT(*) AS n FROM runs WHERE execution_status='running'").fetchone()['n'] == 0
+    assert runner.batch_exit_code(results) == 1
+    store.close()
+
+
+def test_b5_import_from_verified_to_unknown_is_rejected(tmp_path, monkeypatch):
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(score=0.8))
+    before = store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n']
+    shutil.rmtree(output_dir / 'reviews')
+
+    imported = runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert imported['status'] == 'rejected' and imported['committed'] is False
+    assert imported['new_comparability'] == 'unknown'
+    row = store.get_attempt('attempt-1')
+    assert row['validity_status'] == 'complete' and row['comparability'] == 'verified'
+    assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == before
+
+    from llmbench.summary import render
+    formal = render(store, tmp_path).split('## Diagnostics')[0]
+    assert 'attempt-1' in formal
+    audit = read_json(output_dir / 'run_import_rejected.json')
+    assert audit['kept_comparability'] == 'verified'
+    store.close()
+
+
+def test_b5_import_evidence_write_failure_does_not_commit(tmp_path, monkeypatch):
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(score=0.8))
+    before = store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n']
+    real_write = runner.atomic_write_json
+
+    def flaky_write(path, payload):
+        if Path(path).name == 'run_outcome.json':
+            raise OSError(28, 'No space left on device')
+        return real_write(path, payload)
+
+    monkeypatch.setattr(runner, 'atomic_write_json', flaky_write)
+    imported = runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert imported['status'] == 'failed'
+    assert imported['committed'] is False
+    assert imported['evidence_file_updated'] is False
+    assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == before
+    store.close()
+
+
+def test_b5_import_database_failure_reports_evidence_updated(tmp_path, monkeypatch):
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(score=0.8))
+
+    def boom(run_id, outcome):
+        raise RuntimeError('database is read-only')
+
+    monkeypatch.setattr(store, 'finish_attempt', boom)
+    imported = runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert imported['status'] == 'failed'
+    assert imported['committed'] is False
+    assert imported['evidence_file_updated'] is True
+    assert 'database_error' in imported['reason']
+    store.close()
+
+
+def test_b4_assessment_exception_terminates_attempt_and_continues(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError('assessment crashed')
+
+    monkeypatch.setattr(runner, 'apply_coverage', boom)
+    stub_evalscope(monkeypatch, fake_run_task())
+    plan = Plan(data_root=tmp_path, profile='lite', entries=[entry('gpqa_diamond')])
+    store = Store(tmp_path / 'results.db')
+    results = runner.run_plan(plan, store=store, repo_dir=tmp_path)
+    assert len(results) == 1
+    assert results[0].execution_status == 'failed' and results[0].validity_status == 'invalid'
+    row = store.get_attempt(results[0].run_id)
+    assert row['execution_status'] == 'failed'
+    assert store.conn.execute("SELECT COUNT(*) AS n FROM runs WHERE execution_status='running'").fetchone()['n'] == 0
+    diagnostics = json.loads(row['diagnostics_json'])
+    assert diagnostics['attempt_error_phase'] == 'assessment'
+    store.close()

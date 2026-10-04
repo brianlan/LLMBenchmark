@@ -55,6 +55,7 @@ suites:
         requires: [swebench, ms_enclave]
         requires_sandbox: true
         local_path: ${DATA_ROOT}/pinned/swe_bench_verified_django1
+        pinned_instance_id: django__django-10097
         agent_config:
           mode: native
           max_steps: 250

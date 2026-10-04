@@ -36,6 +36,7 @@ class PlanEntry:
     local_path: Path | None = None
     requires: tuple = ()
     status: str = 'configured'
+    pinned_instance: str | None = None
     output_subdir: Path | None = None
 
     @property
@@ -184,6 +185,7 @@ def _build_entry(*, model_alias, model_cfg, suite_cfg, suite_name, dataset, spec
         spec=spec, profile=profile, limit=resolved_limit, batch_size=batch, pinned=pinned,
         local_path=local_path, requires=tuple(spec.get('requires') or ()),
         status=str(spec.get('status') or 'configured'),
+        pinned_instance=spec.get('pinned_instance_id'),
     )
 
 
@@ -305,12 +307,13 @@ def validate_pinned_content(path: Path, expected_instance: str | None = None):
         return False, f'pinned parquet is not readable: {exc.__class__.__name__}: {exc}'
     if table.num_rows != 1:
         return False, f'pinned dataset must contain exactly one sample, found {table.num_rows}'
-    if expected_instance:
-        if 'instance_id' not in table.column_names:
-            return False, 'pinned parquet has no instance_id column'
-        values = table.column('instance_id').to_pylist()
-        if values != [expected_instance]:
-            return False, f'pinned instance_id is {values}, expected [{expected_instance}]'
+    if 'instance_id' not in table.column_names:
+        return False, 'pinned parquet has no instance_id column'
+    values = table.column('instance_id').to_pylist()
+    if not expected_instance:
+        return False, 'pinned content check requires an expected instance id'
+    if values != [expected_instance]:
+        return False, f'pinned instance_id is {values}, expected [{expected_instance}]'
     return True, 'content verified'
 
 
@@ -339,13 +342,19 @@ def check_entry_requirements(entry: PlanEntry, *, check_keys: bool, check_docker
         if check_docker and not docker_available():
             errors.append(f'{entry.dataset}: docker is required for the sandbox but is unavailable')
     if check_pinned and entry.pinned and entry.local_path is not None:
-        ok, reason = validate_pinned_dir(entry.local_path)
-        if not ok:
-            errors.append(f'{entry.dataset}: {reason}; run `bench.py prepare` first')
+        if not entry.pinned_instance:
+            errors.append(
+                f'{entry.dataset}: pinned dataset has no pinned_instance_id in the config'
+            )
         else:
-            content_ok, content_reason = validate_pinned_content(entry.local_path)
-            if not content_ok:
-                errors.append(f'{entry.dataset}: {content_reason}; run `bench.py prepare` first')
+            ok, reason = validate_pinned_dir(entry.local_path, entry.pinned_instance)
+            if not ok:
+                errors.append(f'{entry.dataset}: {reason}; run `bench.py prepare` first')
+            else:
+                content_ok, content_reason = validate_pinned_content(
+                    entry.local_path, entry.pinned_instance)
+                if not content_ok:
+                    errors.append(f'{entry.dataset}: {content_reason}; run `bench.py prepare` first')
     return errors
 
 

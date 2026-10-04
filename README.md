@@ -120,12 +120,12 @@ per attempt:
   - `partial` — some samples errored; shown in the formal table only with
     `--allow-partial`, and then explicitly marked.
   - `unverified` — evidence insufficient to certify completion or the primary
-    score (missing execution summary, requested > manifest selected, missing
-    primary metric identity, NULL primary score, aggregate count above
-    succeeded).
+    score (missing execution summary, non-integer count fields, requested >
+    manifest selected, missing primary metric identity, NULL primary score,
+    aggregate count above succeeded).
   - `invalid` — missing/ambiguous/foreign/corrupt report, no quality metric,
-    non-quality or malformed primary identity, all samples failed, interrupted
-    or failed run.
+    non-quality or malformed primary identity (including an identity that only
+    has a display fallback name), all samples failed, interrupted or failed run.
   - `legacy` — migrated v1 rows with no identity evidence; diagnostics only.
 
 A real score of `0` from a complete run is valid and is recorded as `0`, not as
@@ -153,11 +153,13 @@ Before inference, the actual loaded samples are fingerprinted: question content
 request input (digest).  URL-only media is marked as *not verifiable* in the
 manifest instead of being treated as content evidence.  After inference,
 predictions/reviews are read **only from this attempt's own model directory**
-(`predictions/<report_id>`, `reviews/<report_id>`) and compared with the
-manifest on `(subset, sample_id, repeat_id)`: missing, unexpected, duplicate or
-unparsable evidence blocks `verified` and is recorded per subset in the DB.
-Smoke runs, partial runs, unverified runs and legacy rows appear in the
-diagnostics section of `results/summary.md`, never in the formal table.
+(`predictions/<report_id>`, `reviews/<report_id>`).  Prediction keys are
+matched to the manifest's selected sample IDs, and review keys are matched to
+the **prediction keys** including `repeat_id`, so the score for repeat 1 can
+never certify repeat 0.  Missing, unexpected, duplicate or unparsable evidence
+blocks `verified` and is recorded per subset in the DB.  Smoke runs, partial
+runs, unverified runs and legacy rows appear in the diagnostics section of
+`results/summary.md`, never in the formal table.
 
 Every external surface (DB, `run_outcome.json`, terminal, summary) is rendered
 from the same fully redacted result object, so exception text, report parse
@@ -193,10 +195,13 @@ exit code into `1`.
 
 `import` is idempotent, never rewrites the original evaluation `finished_at`
 (only `imported_at` is updated) and **rejects** a re-parse that would downgrade
-an already accepted run: the previous metrics stay untouched and the rejection
-is audited in `run_import_rejected.json`.  Imports that repair a non-accepted
-run are committed.  Schema v3 adds empty migration columns for the extra
-coverage evidence.
+an already accepted run.  "Downgrade" is evaluated with the same shared rule
+as the summary: an existing `complete`+`verified` result stays in place if the
+new parse is not `complete`+`verified` (including `verified → unknown`), the
+previous metrics are untouched, and the rejection is audited in
+`run_import_rejected.json`.  The evidence file is written before the database
+commit; if either step fails the CLI reports exactly which one was updated.
+Schema v3 adds empty migration columns for the extra coverage evidence.
 
 Each attempt directory keeps the evidence needed to audit or re-import it:
 `run_manifest.json` (redacted plan + config + identities),
@@ -214,13 +219,16 @@ Each attempt directory keeps the evidence needed to audit or re-import it:
 - `--cleanup-images` deletes only images that this run provably created: they
   must be referenced by this run's own predictions, unused by any container,
   and their Docker creation time must not be older than the attempt that
-  referenced them (`docker image inspect`).  Anything unprovable is kept.
+  referenced them (`docker image inspect`).  The CLI passes each attempt's
+  start time to the cleanup; anything unprovable is kept and failed removals
+  are reported.
 - `--dry-run` has zero side effects: no key access, no database, no Docker, no
   downloads.
 - `prepare` writes to a staging directory and atomically replaces the pinned
   dataset; the pinned revision (40-hex, with its source recorded) and parquet
-  hash are stored.  Preflight and `prepare` verify the hash and read the
-  parquet back to confirm one readable sample with the expected instance id.
+  hash are stored.  `pinned_instance_id` in `suites.yaml` is required: preflight
+  and `prepare` verify the hash and read the parquet back to confirm one
+  readable sample with exactly that instance id.
 
 ## Testing
 

@@ -32,6 +32,7 @@ from .runner import (
 )
 from .store import Store
 from .summary import write as write_summary
+from .util import redact_text
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_ROOT = Path(os.environ.get('LLMBENCH_DATA_ROOT', '/ssd4/LLMBenchmark'))
@@ -84,9 +85,10 @@ def _print_dry_run(plan, data_root: Path) -> int:
             'batch_size': entry.batch_size,
             'pinned': entry.pinned,
             'local_path': str(entry.local_path) if entry.local_path else None,
-            'pinned_files_ok': (validate_pinned_dir(entry.local_path)[0]
-                                if entry.pinned and entry.local_path else None),
+            'pinned_files_ok': (validate_pinned_dir(entry.local_path, entry.pinned_instance)[0]
+                                if entry.pinned and entry.local_path and entry.pinned_instance else None),
             'pinned_content_verified': None,  # full content check runs in preflight
+            'pinned_instance': entry.pinned_instance,
             'requires': list(entry.requires),
             'requires_missing': [m for m in entry.requires if not module_available(m)],
             'status': entry.status,
@@ -138,9 +140,9 @@ def _execute(plan, args, repo_dir: Path, data_root: Path) -> int:
         if args.cleanup_images:
             candidates = collect_owned_candidates([result.output_dir for result in results])
             if candidates:
-                report = cleanup_owned_images(candidates)
+                report = cleanup_owned_images(set(candidates), created_after=candidates)
                 print(f"image cleanup: removed={report['removed']} kept={report['kept']} "
-                      f"unproven={sorted(report['unproven'])}")
+                      f"unproven={sorted(report['unproven'])} failed={report['failed']}")
             else:
                 print('image cleanup: no owned SWE-bench images detected; nothing removed')
 
@@ -196,16 +198,25 @@ def cmd_import(args) -> int:
     store = _store(args)
     try:
         result = import_output(Path(args.output_dir), store, repo_dir=repo_dir, data_root=data_root)
-    except Exception as exc:  # noqa: BLE001
-        print(f'import failed: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - parsing failed before any write; redact the message
+        print(f'import failed: {redact_text(f"{exc.__class__.__name__}: {exc}")}', file=sys.stderr)
         print('existing scores were left untouched', file=sys.stderr)
         return 1
     finally:
         store.close()
     print(json.dumps(result, ensure_ascii=False))
-    if result.get('status') == 'rejected':
+    status = result.get('status')
+    if status == 'rejected':
         print('import rejected: the existing accepted result was kept; see run_import_rejected.json',
               file=sys.stderr)
+        return 1
+    if status == 'failed':
+        print(f"import failed: {result.get('reason', 'unknown error')}", file=sys.stderr)
+        if result.get('evidence_file_updated'):
+            print('the evidence file was updated, but the database was NOT committed',
+                  file=sys.stderr)
+        else:
+            print('existing scores were left untouched', file=sys.stderr)
         return 1
     return 0
 

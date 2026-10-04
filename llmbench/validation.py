@@ -23,6 +23,21 @@ COMPARABILITY_UNKNOWN = 'unknown'
 COMPARABILITY_LEGACY = 'legacy'
 
 
+def has_formal_eligibility(validity_status, comparability) -> bool:
+    """The single shared rule for appearing in the formal results table."""
+    return validity_status == VALID and comparability == COMPARABILITY_VERIFIED
+
+
+def _as_int(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 def _reason(reasons, key, detail=None):
     reasons.append(f'{key}: {detail}' if detail else key)
 
@@ -71,6 +86,10 @@ def assess_run(*, interrupted=False, task_error=None, report_error=None, metrics
     if not primary.get('metric_name') or not primary.get('metric_key'):
         _reason(reasons, 'primary_metric_invalid_identity')
         return _outcome(COMPLETED, INVALID, reasons)
+    if primary.get('identity_valid') is False:
+        # A display fallback name must not substitute for a valid report identity.
+        _reason(reasons, 'primary_metric_invalid_identity', 'report identity has no name')
+        return _outcome(COMPLETED, INVALID, reasons)
     if primary.get('score') is None:
         _reason(reasons, 'primary_metric_missing_score', str(primary.get('metric_name')))
         return _outcome(COMPLETED, UNVERIFIED, reasons)
@@ -82,10 +101,23 @@ def assess_run(*, interrupted=False, task_error=None, report_error=None, metrics
     if not execution_summary:
         _reason(reasons, 'missing_execution_summary')
         return _outcome(COMPLETED, UNVERIFIED, reasons)
+    if not isinstance(execution_summary, dict):
+        _reason(reasons, 'invalid_execution_summary', type(execution_summary).__name__)
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
 
-    requested = execution_summary.get('requested')
-    succeeded = execution_summary.get('succeeded')
-    errored = execution_summary.get('errored') or 0
+    requested = _as_int(execution_summary.get('requested'))
+    succeeded = _as_int(execution_summary.get('succeeded'))
+    errored = _as_int(execution_summary.get('errored'))
+    incomplete = execution_summary.get('incomplete')
+    if any(raw is not None and _as_int(raw) is None for raw in (
+            execution_summary.get('requested'), execution_summary.get('succeeded'),
+            execution_summary.get('errored'))):
+        _reason(reasons, 'invalid_execution_summary', 'counts must be integers')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
+    if incomplete not in (None, True, False):
+        _reason(reasons, 'invalid_execution_summary', 'incomplete must be a boolean')
+        return _outcome(COMPLETED, UNVERIFIED, reasons)
+    errored = errored or 0
     if requested is None or requested <= 0:
         _reason(reasons, 'no_requested_samples')
         return _outcome(COMPLETED, UNVERIFIED, reasons)
@@ -106,7 +138,7 @@ def assess_run(*, interrupted=False, task_error=None, report_error=None, metrics
         _reason(reasons, 'partial_completion', f'succeeded={succeeded}/{requested} errored={errored}')
         return _outcome(COMPLETED, PARTIAL, reasons)
 
-    if execution_summary.get('incomplete'):
+    if incomplete:
         _reason(reasons, 'upstream_marked_incomplete')
         return _outcome(COMPLETED, PARTIAL, reasons)
 
@@ -145,24 +177,29 @@ def assess_comparability(manifest_rows, output_evidence) -> tuple[str, list[str]
         if not row.get('media_evidence', True):
             reasons.append(f'{subset}: media content not verifiable')
         selected = row.get('selected') or 0
-        if row.get('predicted') is None or row.get('reviewed') is None:
-            reasons.append(f'{subset}: coverage unknown')
+        has_diffs = any(key in row for key in (
+            'predicted_missing', 'predicted_extra', 'reviewed_missing', 'reviewed_extra'))
+        if not has_diffs:
+            # Legacy/imported rows without explicit diffs: fall back to counts.
+            if row.get('predicted') is None or row.get('reviewed') is None:
+                reasons.append(f'{subset}: coverage unknown')
+                continue
+            if row.get('predicted') < selected or row.get('reviewed') < selected:
+                reasons.append(
+                    f'{subset}: coverage gap predicted={row.get("predicted")} '
+                    f'reviewed={row.get("reviewed")}/{selected}'
+                )
             continue
-        if row.get('predicted') < selected or row.get('reviewed') < selected:
-            reasons.append(
-                f'{subset}: coverage gap predicted={row.get("predicted")} '
-                f'reviewed={row.get("reviewed")}/{selected}'
-            )
         for kind in ('predicted', 'reviewed'):
             missing = row.get(f'{kind}_missing') or []
             extra = row.get(f'{kind}_extra') or []
             duplicates = row.get(f'{kind}_duplicates') or 0
             if missing:
-                reasons.append(f'{subset}: {kind} missing ids {missing[:5]}')
+                reasons.append(f'{subset}: {kind} missing evidence keys {missing[:5]}')
             if extra:
-                reasons.append(f'{subset}: {kind} unexpected ids {extra[:5]}')
+                reasons.append(f'{subset}: {kind} unexpected evidence keys {extra[:5]}')
             if duplicates:
-                reasons.append(f'{subset}: {kind} duplicate ids x{duplicates}')
+                reasons.append(f'{subset}: {kind} duplicate evidence keys x{duplicates}')
 
     if reasons:
         return COMPARABILITY_UNKNOWN, reasons
