@@ -287,6 +287,88 @@ def test_diagnostics_count_truncation_and_ignore_tool_calls(tmp_path):
     assert diagnostics['generation_calls'] == 12
 
 
+def _manifest_for_evidence(sample_ids=('0', '1')):
+    return [{
+        'subset': 'default', 'selected': len(sample_ids), 'sample_ids': list(sample_ids),
+        'question_digest': 'q', 'media_digest': 'm', 'input_digest': 'i', 'media_evidence': True,
+    }]
+
+
+def _write_evidence_files(out, report_id, predicted, reviewed, dataset='gpqa_diamond'):
+    for folder, ids in (('predictions', predicted), ('reviews', reviewed)):
+        root = out / folder / report_id
+        root.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({'index': sample_id, 'model_output': {
+            'choices': [{'stop_reason': 'stop'}], 'usage': {'input_tokens': 1, 'output_tokens': 1}}})
+            for sample_id in ids]
+        (root / f'{dataset}_default.jsonl').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def test_comparability_requires_matching_sample_ids(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_evidence_files(out, MODEL, [0, 1], [0, 1])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(), evidence)
+    assert (rows[0]['predicted'], rows[0]['reviewed']) == (2, 2)
+    assert rows[0]['predicted_missing'] == [] and rows[0]['reviewed_missing'] == []
+
+
+
+def test_disjoint_ids_are_not_verified(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_evidence_files(out, MODEL, [100, 101], [100, 101])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(), evidence)
+    assert rows[0]['predicted'] == 0
+    assert rows[0]['predicted_missing'] == ['0', '1']
+    assert rows[0]['predicted_extra'] == ['100', '101']
+    from llmbench.validation import assess_comparability, COMPARABILITY_UNKNOWN
+    status, reasons = assess_comparability(rows, evidence)
+    assert status == COMPARABILITY_UNKNOWN
+    assert any('missing ids' in reason for reason in reasons)
+
+
+def test_other_model_directory_is_not_this_attempts_evidence(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_evidence_files(out, 'other-model', [0, 1], [0, 1])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(), evidence)
+    assert rows[0]['predicted'] == 0
+    assert rows[0]['predicted_missing'] == ['0', '1']
+
+
+def test_duplicates_and_malformed_lines_block_verification(tmp_path):
+    out = tmp_path / 'attempt'
+    _write_evidence_files(out, MODEL, [0, 0], [0, 1])
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(), evidence)
+    assert rows[0]['predicted_duplicates'] == 1
+
+    malformed_out = tmp_path / 'attempt2'
+    _write_evidence_files(malformed_out, MODEL, [0], [0, 1])
+    path = malformed_out / 'predictions' / MODEL / 'gpqa_diamond_default.jsonl'
+    path.write_text(path.read_text(encoding='utf-8') + '{broken\n', encoding='utf-8')
+    evidence = collect_output_evidence(malformed_out, 'gpqa_diamond', report_id=MODEL)
+    from llmbench.validation import assess_comparability, COMPARABILITY_UNKNOWN
+    status, reasons = assess_comparability(apply_coverage(_manifest_for_evidence(), evidence), evidence)
+    assert status == COMPARABILITY_UNKNOWN
+    assert any('malformed' in reason for reason in reasons)
+
+
+def test_repeat_ids_are_not_duplicates(tmp_path):
+    out = tmp_path / 'attempt'
+    root = out / 'predictions' / MODEL
+    root.mkdir(parents=True)
+    lines = [json.dumps({'index': 0, 'repeat_id': repeat,
+                         'model_output': {'choices': [{'stop_reason': 'stop'}], 'usage': {}}})
+             for repeat in (0, 1)]
+    (root / 'gpqa_diamond_default.jsonl').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    evidence = collect_output_evidence(out, 'gpqa_diamond', report_id=MODEL)
+    rows = apply_coverage(_manifest_for_evidence(sample_ids=('0',)), evidence)
+    assert rows[0]['predicted'] == 1
+    assert rows[0]['predicted_duplicates'] == 0
+
+
 def test_malformed_jsonl_lines_are_reported_not_hidden(tmp_path):
     out = tmp_path / 'attempt'
     (out / 'predictions' / MODEL).mkdir(parents=True)
@@ -296,7 +378,7 @@ def test_malformed_jsonl_lines_are_reported_not_hidden(tmp_path):
     )
     evidence = collect_output_evidence(out, 'gpqa_diamond')
     assert evidence['malformed_lines']
-    assert evidence['subsets']['default']['predicted'] == ['0']
+    assert evidence['subsets']['default']['predicted'] == ['0#r0']
 
 
 def test_real_prediction_fixture_integration(tmp_path):

@@ -13,12 +13,16 @@ from llmbench.validation import (
 )
 
 
-def quality_metric(score=0.5):
-    return {'semantics_kind': 'quality', 'score': score, 'is_primary': True}
+def quality_metric(score=0.5, is_primary=True, metric_name='accuracy', num=5,
+                   semantics='quality'):
+    return {'metric_key': f'mk-{metric_name}', 'metric_name': metric_name,
+            'semantics_kind': semantics, 'score': score, 'num': num,
+            'is_primary': is_primary}
 
 
 def diagnostic_metric():
-    return {'semantics_kind': 'diagnostic', 'score': 1.0, 'is_primary': False}
+    return {'metric_key': 'mk-diag', 'metric_name': 'latency', 'semantics_kind': 'diagnostic',
+            'score': 1.0, 'num': 5, 'is_primary': False}
 
 
 def manifest_row(selected=5, predicted=5, reviewed=5, media=True, digests=True):
@@ -102,18 +106,72 @@ def test_interrupted_and_task_error_statuses():
     assert result['execution_status'] == 'failed' and result['validity_status'] == INVALID
 
 
+def test_missing_primary_metric_is_unverified():
+    result = assess_run(metrics=[quality_metric(is_primary=False)],
+                        execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'missing_primary_metric' in result['status_reason']
+
+
+def test_null_primary_score_is_unverified_not_complete():
+    result = assess_run(metrics=[quality_metric(score=None)],
+                        execution_summary={'requested': 5, 'succeeded': 5},
+                        manifest_rows=[manifest_row()])
+    assert result['validity_status'] == UNVERIFIED
+    assert 'primary_metric_missing_score' in result['status_reason']
+
+
+def test_primary_metric_without_samples_is_unverified():
+    result = assess_run(metrics=[quality_metric(num=0)],
+                        execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'primary_metric_no_samples' in result['status_reason']
+
+
+def test_primary_metric_count_above_succeeded_is_unverified():
+    result = assess_run(metrics=[quality_metric(num=9)],
+                        execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == UNVERIFIED
+    assert 'primary_metric_count_exceeds_succeeded' in result['status_reason']
+
+
+def test_diagnostic_primary_metric_is_invalid():
+    metrics = [
+        quality_metric(is_primary=False),
+        quality_metric(metric_name='latency', semantics='diagnostic', is_primary=True),
+    ]
+    result = assess_run(metrics=metrics, execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == INVALID
+    assert 'primary_metric_not_quality' in result['status_reason']
+
+
+def test_invalid_primary_identity_is_invalid():
+    metric = quality_metric(metric_name='')
+    result = assess_run(metrics=[metric], execution_summary={'requested': 5, 'succeeded': 5})
+    assert result['validity_status'] == INVALID
+    assert 'primary_metric_invalid_identity' in result['status_reason']
+
+
 def test_comparability_verified_and_unknown():
-    status, _ = assess_comparability([manifest_row()], {'subsets': {}})
+    verified_row = manifest_row()
+    verified_row.update({'predicted_missing': [], 'predicted_extra': [], 'predicted_duplicates': 0,
+                         'reviewed_missing': [], 'reviewed_extra': [], 'reviewed_duplicates': 0})
+    evidence = {'subsets': {'default': {}}, 'malformed_lines': []}
+    status, _ = assess_comparability([verified_row], evidence)
     assert status == COMPARABILITY_VERIFIED
 
-    status, reasons = assess_comparability([manifest_row(reviewed=4)], {'subsets': {}})
+    status, reasons = assess_comparability([{**verified_row, 'reviewed_missing': ['3']}], evidence)
     assert status == COMPARABILITY_UNKNOWN
-    assert any('coverage gap' in reason for reason in reasons)
+    assert any('missing ids' in reason for reason in reasons)
 
-    status, reasons = assess_comparability([manifest_row(media=False)], {'subsets': {}})
+    status, reasons = assess_comparability([verified_row], {'subsets': {}, 'malformed_lines': [{}]})
+    assert status == COMPARABILITY_UNKNOWN
+    assert any('malformed' in reason for reason in reasons)
+
+    status, reasons = assess_comparability([manifest_row(media=False)], evidence)
     assert status == COMPARABILITY_UNKNOWN
     assert any('media' in reason for reason in reasons)
 
-    status, reasons = assess_comparability([], {'subsets': {}})
+    status, reasons = assess_comparability([], evidence)
     assert status == COMPARABILITY_UNKNOWN
     assert 'no_sample_manifest' in reasons

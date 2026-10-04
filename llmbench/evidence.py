@@ -397,6 +397,21 @@ def _sample_id(line: dict):
     return None if sample_id is None else str(sample_id)
 
 
+def _repeat_id(line: dict):
+    repeat = line.get('repeat_id', line.get('repeat'))
+    try:
+        return int(repeat)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_key(line: dict):
+    sample_id = _sample_id(line)
+    if sample_id is None:
+        return None
+    return f'{sample_id}#r{_repeat_id(line)}'
+
+
 def _generation_diagnostics(line: dict):
     """Return (stop_reasons, usage, agent_steps) for one prediction line."""
     reasons = []
@@ -424,31 +439,42 @@ def _generation_diagnostics(line: dict):
     return reasons, usage, steps
 
 
-def collect_output_evidence(output_dir: Path, dataset: str) -> dict:
-    """Return per-subset predicted/reviewed coverage, diagnostics and malformed-line records."""
+def collect_output_evidence(output_dir: Path, dataset: str, *, report_id: str | None = None) -> dict:
+    """Collect per-subset coverage and diagnostics from this attempt's own files.
+
+    When ``report_id`` is given, only ``predictions/<report_id>`` and
+    ``reviews/<report_id>`` are read: files of another model are not this run's
+    evidence.  Sample IDs keep their repeat id, so legitimate repeats are not
+    mistaken for duplicates.
+    """
     per_subset = defaultdict(lambda: {
-        'predicted': set(), 'reviewed': set(),
+        'predicted_ids': [], 'reviewed_ids': [],
+        'predicted_sources': [], 'reviewed_sources': [],
         'stop_reasons': Counter(), 'usage': defaultdict(float), 'usage_samples': 0,
         'agent_steps': [], 'missing_stop_reason': 0, 'missing_usage': 0,
     })
     malformed = []
     for folder, key in (('predictions', 'predicted'), ('reviews', 'reviewed')):
         root = Path(output_dir) / folder
+        if report_id is not None:
+            root = root / report_id
         if not root.exists():
             continue
-        for path in sorted(root.rglob('*.jsonl')):
+        paths = sorted(root.glob('*.jsonl')) if report_id is not None else sorted(root.rglob('*.jsonl'))
+        for path in paths:
             subset = _subset_from_stem(path.stem, dataset)
             entry = per_subset[subset]
+            entry[f'{key}_sources'].append(str(path))
 
-            def on_error(line_number, exc, path=path, subset=subset):
+            def on_error(line_number, exc, path=path):
                 malformed.append({'path': str(path), 'line': line_number, 'error': str(exc)})
 
             for line in read_jsonl(path, on_error=on_error):
-                sample_id = _sample_id(line)
+                sample_id = _evidence_key(line)
                 if sample_id is None:
                     malformed.append({'path': str(path), 'line': None, 'error': 'no sample id'})
                     continue
-                entry[key].add(sample_id)
+                entry[f'{key}_ids'].append(sample_id)
                 if key == 'predicted':
                     reasons, usage, steps = _generation_diagnostics(line)
                     has_stop = any(reason != 'unknown' for reason in reasons)
@@ -471,11 +497,13 @@ def collect_output_evidence(output_dir: Path, dataset: str) -> dict:
                     else:
                         entry['missing_usage'] += 1
 
-    result = {'subsets': {}, 'malformed_lines': malformed}
+    result = {'subsets': {}, 'malformed_lines': malformed, 'report_id': report_id}
     for subset, entry in sorted(per_subset.items()):
         result['subsets'][subset] = {
-            'predicted': sorted(entry['predicted']),
-            'reviewed': sorted(entry['reviewed']),
+            'predicted': entry['predicted_ids'],
+            'reviewed': entry['reviewed_ids'],
+            'predicted_sources': entry['predicted_sources'],
+            'reviewed_sources': entry['reviewed_sources'],
             'stop_reasons': dict(entry['stop_reasons']),
             'usage': dict(entry['usage']),
             'usage_samples': entry['usage_samples'],
@@ -486,19 +514,53 @@ def collect_output_evidence(output_dir: Path, dataset: str) -> dict:
     return result
 
 
+def _coverage_diff(expected: list, observed: list) -> dict:
+    """Compare expected sample IDs with observed evidence keys.
+
+    Observed keys carry a repeat id (``<sample>#r<n>``); multiple legitimate
+    repeats count as coverage, while the same (sample, repeat) key twice counts
+    as a duplicate.
+    """
+    expected_set = set(expected)
+    observed_bases = {key.rsplit('#r', 1)[0] for key in observed}
+    if expected_set:
+        missing = sorted(expected_set - observed_bases)
+        extra = sorted(observed_bases - expected_set)
+        covered = len(expected_set & observed_bases)
+    else:
+        missing, extra, covered = [], sorted(observed_bases), len(observed_bases)
+    occurrences = Counter(observed)
+    return {
+        'covered': covered,
+        'total': len(observed),
+        'missing': missing,
+        'extra': extra,
+        'duplicates': sum(count - 1 for count in occurrences.values() if count > 1),
+    }
+
+
 def apply_coverage(manifest_rows: list[dict], output_evidence: dict) -> list[dict]:
-    """Merge selected/predicted/reviewed coverage into sample_manifest rows."""
-    subsets = output_evidence.get('subsets') or {}
+    """Merge coverage into sample_manifest rows, keeping the ID-set differences."""
+    subsets = (output_evidence or {}).get('subsets') or {}
     merged = []
     for row in manifest_rows:
         subset = row['subset']
         coverage = subsets.get(subset, {})
-        predicted = coverage.get('predicted') or []
-        reviewed = coverage.get('reviewed') or []
+        expected = [str(item) for item in (row.get('sample_ids') or [])]
+        predicted = _coverage_diff(expected, [str(item) for item in coverage.get('predicted') or []])
+        reviewed = _coverage_diff(expected, [str(item) for item in coverage.get('reviewed') or []])
         merged.append({
             **row,
-            'predicted': len(predicted),
-            'reviewed': len(reviewed),
+            'predicted': predicted['covered'],
+            'predicted_total': predicted['total'],
+            'predicted_missing': predicted['missing'],
+            'predicted_extra': predicted['extra'],
+            'predicted_duplicates': predicted['duplicates'],
+            'reviewed': reviewed['covered'],
+            'reviewed_total': reviewed['total'],
+            'reviewed_missing': reviewed['missing'],
+            'reviewed_extra': reviewed['extra'],
+            'reviewed_duplicates': reviewed['duplicates'],
         })
     return merged
 

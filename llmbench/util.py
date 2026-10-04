@@ -24,6 +24,13 @@ SECRET_KEY_SUFFIXES = ('_api_key', '_secret', '_password', '_token')
 
 _URL_CREDENTIALS = re.compile(r'(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@')
 
+# Defense in depth for values whose secret is unknown to the redactor (e.g. an
+# exception raised while re-parsing an old output directory).
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r'sk-[A-Za-z0-9][A-Za-z0-9._-]{6,}'),
+    re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'),
+)
+
 
 def is_secret_key(key: str) -> bool:
     """Exact key-name match, so counters like ``input_tokens``/``max_tokens`` are kept."""
@@ -57,6 +64,17 @@ def to_jsonable(value):
     if hasattr(value, '__dict__') and not callable(value):
         return to_jsonable({k: v for k, v in vars(value).items() if not k.startswith('_')})
     return str(value)
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge; lists and scalars in ``override`` replace the base."""
+    result = dict(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 def canonical_json(value) -> str:
@@ -107,6 +125,8 @@ def redact_text(text: str, secrets=()) -> str:
     for secret in secrets:
         if secret:
             text = text.replace(secret, '***')
+    for pattern in _SECRET_VALUE_PATTERNS:
+        text = pattern.sub('***', text)
     return text
 
 
@@ -118,12 +138,20 @@ def collect_secrets(*configs) -> list:
             continue
         for key in ('api_key', 'token', 'secret', 'password'):
             value = config.get(key)
-            if isinstance(value, str) and value and value != 'EMPTY':
+            if _is_real_secret(value):
                 secrets.append(value)
         env_name = config.get('api_key_env')
-        if env_name and os.environ.get(env_name):
+        if env_name and _is_real_secret(os.environ.get(env_name)):
             secrets.append(os.environ[env_name])
     return secrets
+
+
+def _is_real_secret(value) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if value in ('EMPTY', '***', 'REDACTED'):
+        return False
+    return value.strip('*') != ''
 
 
 def atomic_write_text(path: Path, text: str) -> None:

@@ -20,7 +20,7 @@ from .config import (
     preflight,
     validate_pinned_dir,
 )
-from .images import cleanup_owned_images, collect_owned_images
+from .images import cleanup_owned_images, collect_owned_candidates
 from .prepare import prepare_django_dataset
 from .runner import (
     BatchInterrupted,
@@ -84,8 +84,9 @@ def _print_dry_run(plan, data_root: Path) -> int:
             'batch_size': entry.batch_size,
             'pinned': entry.pinned,
             'local_path': str(entry.local_path) if entry.local_path else None,
-            'pinned_ready': (validate_pinned_dir(entry.local_path)[0]
-                             if entry.pinned and entry.local_path else None),
+            'pinned_files_ok': (validate_pinned_dir(entry.local_path)[0]
+                                if entry.pinned and entry.local_path else None),
+            'pinned_content_verified': None,  # full content check runs in preflight
             'requires': list(entry.requires),
             'requires_missing': [m for m in entry.requires if not module_available(m)],
             'status': entry.status,
@@ -135,23 +136,32 @@ def _execute(plan, args, repo_dir: Path, data_root: Path) -> int:
             interrupted = True
 
         if args.cleanup_images:
-            images = collect_owned_images([result.output_dir for result in results])
-            if images:
-                report = cleanup_owned_images(images)
-                print(f"image cleanup: removed={report['removed']} kept={report['kept']}")
+            candidates = collect_owned_candidates([result.output_dir for result in results])
+            if candidates:
+                report = cleanup_owned_images(candidates)
+                print(f"image cleanup: removed={report['removed']} kept={report['kept']} "
+                      f"unproven={sorted(report['unproven'])}")
             else:
                 print('image cleanup: no owned SWE-bench images detected; nothing removed')
 
-        summary_path = write_summary(
-            store, repo_dir / 'results' / 'summary.md', data_root,
-            include_partial=args.allow_partial,
-        )
-        print(f'summary written to {summary_path}')
+        summary_error = None
+        try:
+            summary_path = write_summary(
+                store, repo_dir / 'results' / 'summary.md', data_root,
+                include_partial=args.allow_partial,
+            )
+            print(f'summary written to {summary_path}')
+        except Exception as exc:  # noqa: BLE001 - runs are persisted; report the failure
+            summary_error = f'{exc.__class__.__name__}: {exc}'
+            print(f'!!! summary generation failed after the runs were recorded: {summary_error}',
+                  file=sys.stderr)
     finally:
         store.close()
 
     if interrupted:
         return 130
+    if summary_error:
+        return 1
     return batch_exit_code(results, allow_partial=args.allow_partial)
 
 
@@ -193,6 +203,10 @@ def cmd_import(args) -> int:
     finally:
         store.close()
     print(json.dumps(result, ensure_ascii=False))
+    if result.get('status') == 'rejected':
+        print('import rejected: the existing accepted result was kept; see run_import_rejected.json',
+              file=sys.stderr)
+        return 1
     return 0
 
 

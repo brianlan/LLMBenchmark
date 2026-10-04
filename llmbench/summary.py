@@ -64,6 +64,7 @@ def collect_other_rows(store):
         WHERE r.validity_status IS NULL OR r.validity_status != 'complete'
            OR r.comparability != 'verified'
            OR r.profile = 'smoke'
+           OR m.metric_name IS NULL
         ORDER BY r.started_at DESC
         LIMIT 200
         """,

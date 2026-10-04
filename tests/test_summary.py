@@ -8,7 +8,7 @@ def seed_run(store, run_id, *, model_alias='minimax', model_config='mc1', datase
              profile='full', validity='complete', comparability='verified', score=0.8,
              metric='accuracy', finished='2026-01-01T00:00:01', protocol='proto-1',
              samples='samples-1', exec_status='completed', reason='complete',
-             eval_version='1.12.0', display_kind='percent', unit='%'):
+             eval_version='1.12.0', display_kind='percent', unit='%', metrics=None):
     store.start_attempt({
         'run_id': run_id, 'run_group': 'g', 'model_alias': model_alias, 'model_id': 'm',
         'api_url': 'https://api.example/v1', 'model_config_identity': model_config,
@@ -26,7 +26,7 @@ def seed_run(store, run_id, *, model_alias='minimax', model_config='mc1', datase
         'report_path': 'p', 'diagnostics': {'generation_calls': 20},
         'perf_metrics': None, 'primary_metric_identity': {'name': metric},
         'protocol_identity': protocol, 'sample_manifest_identity': samples,
-        'metrics': [{
+        'metrics': metrics if metrics is not None else [{
             'metric_key': f'mk-{metric}', 'metric_name': metric, 'aggregation': 'mean',
             'dimensions': {}, 'category_key': TOP_CATEGORY_KEY, 'category': [], 'subset': '',
             'num': 20, 'score': score, 'macro_score': None, 'semantics_kind': 'quality',
@@ -124,6 +124,15 @@ def test_null_score_displays_na_and_versions_are_visible(tmp_path):
     assert 'N/A' in text
     assert '1.12.0' in text
     assert 'tool version is the renderer' in text.lower() or 'Tool version is the renderer' in text
+    store.close()
+
+
+def test_verified_run_without_primary_metric_is_still_visible(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    seed_run(store, 'no-primary-metric', metrics=[], reason='no_metrics')
+    text = render(store, tmp_path)
+    assert 'no-primary-metric' not in text.split('## Diagnostics')[0]
+    assert 'no-primary-metric' in text.split('## Diagnostics')[1]
     store.close()
 
 

@@ -133,7 +133,27 @@ def test_migration_from_v1_preserves_legacy_evidence(tmp_path):
     manifest = store.latest_extra('v1-run')
     assert manifest[0]['subset'] == 'legacy'
     assert manifest[0]['selected'] == 2
-    assert store.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == '2'
+    assert store.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == '3'
+    assert 'imported_at' in {row[1] for row in store.conn.execute('PRAGMA table_info(runs)')}
+    assert 'predicted_missing_json' in {row[1] for row in store.conn.execute('PRAGMA table_info(sample_manifest)')}
+    store.close()
+
+
+def test_finish_attempt_preserves_finished_at_and_records_imported_at(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    store.start_attempt(attempt_record('run-1'))
+    store.finish_attempt('run-1', outcome(0.5))
+    first = store.get_attempt('run-1')
+    assert first['finished_at'] == '2026-01-01T00:01:00'
+    assert first['imported_at'] is None
+
+    imported = outcome(0.9)
+    imported['finished_at'] = None  # an import must not pretend the run just finished
+    imported['imported_at'] = '2026-02-01T00:00:00'
+    store.finish_attempt('run-1', imported)
+    second = store.get_attempt('run-1')
+    assert second['finished_at'] == '2026-01-01T00:01:00'
+    assert second['imported_at'] == '2026-02-01T00:00:00'
     store.close()
 
 

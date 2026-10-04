@@ -7,9 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from .util import now_iso
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -44,7 +42,8 @@ CREATE TABLE IF NOT EXISTS runs (
     primary_metric_json     TEXT,
     diagnostics_json        TEXT,
     perf_json               TEXT,
-    error                   TEXT
+    error                   TEXT,
+    imported_at             TEXT
 );
 CREATE TABLE IF NOT EXISTS metrics (
     run_id          TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -76,9 +75,29 @@ CREATE TABLE IF NOT EXISTS sample_manifest (
     media_digest    TEXT,
     input_digest    TEXT,
     media_evidence  INTEGER,
+    predicted_missing_json TEXT,
+    predicted_extra_json   TEXT,
+    predicted_duplicates   INTEGER,
+    reviewed_missing_json  TEXT,
+    reviewed_extra_json    TEXT,
+    reviewed_duplicates    INTEGER,
+    evidence_scoped        INTEGER,
     PRIMARY KEY (run_id, subset)
 );
 """
+
+V2_COLUMN_UPGRADES = {
+    'runs': {'imported_at': 'TEXT'},
+    'sample_manifest': {
+        'predicted_missing_json': 'TEXT',
+        'predicted_extra_json': 'TEXT',
+        'predicted_duplicates': 'INTEGER',
+        'reviewed_missing_json': 'TEXT',
+        'reviewed_extra_json': 'TEXT',
+        'reviewed_duplicates': 'INTEGER',
+        'evidence_scoped': 'INTEGER',
+    },
+}
 
 RUN_INSERT_COLUMNS = (
     'run_id', 'run_group', 'model_alias', 'model_id', 'api_url', 'model_config_identity',
@@ -129,11 +148,22 @@ class Store:
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
         )
         self.conn.executescript(SCHEMA_V2)
+        self._ensure_columns()
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
         self.conn.commit()
+
+    def _ensure_columns(self) -> None:
+        """Idempotently add columns introduced after the initial v2 schema."""
+        for table, columns in V2_COLUMN_UPGRADES.items():
+            if not self._has_table(table):
+                continue
+            existing = _table_columns(self.conn, table)
+            for name, sql_type in columns.items():
+                if name not in existing:
+                    self.conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {sql_type}')
 
     def _migrate_v1_to_v2(self) -> None:
         """Preserve v1 rows as legacy/unverified evidence; never fabricate identity.
@@ -239,21 +269,23 @@ class Store:
         with self.transaction():
             self.conn.execute(
                 """UPDATE runs SET execution_status=?, validity_status=?, status_reason=?,
-                       phase=?, comparability=?, finished_at=?, num_requested=?, num_succeeded=?,
+                       phase=?, comparability=?, finished_at=COALESCE(?, finished_at),
+                       num_requested=?, num_succeeded=?,
                        num_errored=?, incomplete=?, report_path=?, diagnostics_json=?,
                        perf_json=?, error=?, protocol_identity=COALESCE(?, protocol_identity),
                        sample_manifest_identity=COALESCE(?, sample_manifest_identity),
-                       primary_metric_json=?
+                       primary_metric_json=?, imported_at=COALESCE(?, imported_at)
                    WHERE run_id=?""",
                 (outcome.get('execution_status'), outcome.get('validity_status'),
                  outcome.get('status_reason'), outcome.get('phase', 'done'),
-                 outcome.get('comparability'), outcome.get('finished_at', now_iso()),
+                 outcome.get('comparability'), outcome.get('finished_at'),
                  outcome.get('num_requested'), outcome.get('num_succeeded'),
                  outcome.get('num_errored'), outcome.get('incomplete'),
                  outcome.get('report_path'), _dumps(outcome.get('diagnostics')),
                  _dumps(outcome.get('perf_metrics')), outcome.get('error'),
                  outcome.get('protocol_identity'), outcome.get('sample_manifest_identity'),
                  _dumps(outcome.get('primary_metric_identity')),
+                 outcome.get('imported_at'),
                  run_id),
             )
             self.conn.execute('DELETE FROM metrics WHERE run_id=?', (run_id,))
@@ -267,8 +299,11 @@ class Store:
             self.conn.execute('DELETE FROM sample_manifest WHERE run_id=?', (run_id,))
             self.conn.executemany(
                 """INSERT INTO sample_manifest (run_id, subset, selected, predicted, reviewed,
-                       sample_ids_json, question_digest, media_digest, input_digest, media_evidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       sample_ids_json, question_digest, media_digest, input_digest, media_evidence,
+                       predicted_missing_json, predicted_extra_json, predicted_duplicates,
+                       reviewed_missing_json, reviewed_extra_json, reviewed_duplicates,
+                       evidence_scoped)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [_manifest_values(run_id, row) for row in outcome.get('sample_manifest') or []],
             )
 
@@ -309,4 +344,9 @@ def _manifest_values(run_id: str, row: dict):
         run_id, row['subset'], row.get('selected'), row.get('predicted'), row.get('reviewed'),
         _dumps(row.get('sample_ids')), row.get('question_digest'), row.get('media_digest'),
         row.get('input_digest'), 1 if row.get('media_evidence') else 0,
+        _dumps(row.get('predicted_missing')), _dumps(row.get('predicted_extra')),
+        row.get('predicted_duplicates'),
+        _dumps(row.get('reviewed_missing')), _dumps(row.get('reviewed_extra')),
+        row.get('reviewed_duplicates'),
+        1 if row.get('evidence_scoped', True) else 0,
     )

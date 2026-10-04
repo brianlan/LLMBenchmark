@@ -48,6 +48,13 @@ def test_redact_text_strips_url_credentials():
     assert '***@api.example.com' in redact_text('https://user:pass@api.example.com/v1')
 
 
+def test_redact_text_masks_provider_key_patterns_without_touching_counts():
+    text = 'failed with sk-review-SENTINEL-not-a-real-key and max_tokens=32768'
+    redacted = redact_text(text)
+    assert 'SENTINEL' not in redacted
+    assert 'max_tokens=32768' in redacted
+
+
 def test_secret_key_detection():
     assert is_secret_key('api_key')
     assert is_secret_key('Authorization')
@@ -73,6 +80,9 @@ def test_collect_secrets_reads_env(monkeypatch):
     monkeypatch.setenv('LLMBENCH_TEST_KEY', 'env-secret')
     assert 'env-secret' in collect_secrets({'api_key_env': 'LLMBENCH_TEST_KEY'})
     assert collect_secrets({'api_key': 'literal'}) == ['literal']
+    # masked placeholders are not secrets (or they would redact the whole document)
+    assert collect_secrets({'api_key': '***'}) == []
+    assert collect_secrets({'api_key': 'EMPTY'}) == []
 
 
 def test_atomic_write_text(tmp_path):

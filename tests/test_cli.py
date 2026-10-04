@@ -117,3 +117,35 @@ def test_import_without_manifest_exits_1(tmp_path, capsys):
     ])
     assert exit_code == 1
     assert 'left untouched' in capsys.readouterr().err
+
+
+def test_rejected_import_exits_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr('llmbench.cli.import_output', lambda *a, **k: {
+        'status': 'rejected', 'committed': False, 'run_id': 'r1', 'reason': 'no_metrics'})
+    exit_code = main([
+        'import', '--output-dir', str(tmp_path), '--data-root', str(tmp_path),
+        '--db', str(tmp_path / 'results.db'),
+    ])
+    assert exit_code == 1
+    assert 'import rejected' in capsys.readouterr().err
+
+
+def test_summary_write_failure_returns_exit_1(tmp_path, monkeypatch, capsys):
+    from llmbench.runner import AttemptResult
+
+    monkeypatch.setenv('MINIMAX_API_KEY', 'test-key')
+    monkeypatch.setattr('llmbench.cli._preflight_errors', lambda plan, data_root: [])
+    monkeypatch.setattr('llmbench.cli.resolve_task_config', lambda raw: {})
+    ok = AttemptResult('r1', tmp_path / 'out', 'completed', 'complete', 'complete', True)
+    monkeypatch.setattr('llmbench.cli.run_plan', lambda plan, store, repo_dir: [ok])
+
+    def boom(*args, **kwargs):
+        raise OSError(28, 'No space left on device')
+
+    monkeypatch.setattr('llmbench.cli.write_summary', boom)
+    exit_code = main([
+        'run', '--suite', 'knowledge', '--profile', 'smoke', '--datasets', 'gpqa_diamond',
+        '--data-root', str(tmp_path), '--config-dir', CONFIGS,
+    ])
+    assert exit_code == 1
+    assert 'summary generation failed' in capsys.readouterr().err

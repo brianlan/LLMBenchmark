@@ -72,6 +72,11 @@ def fake_capture(callback):
     yield {}
 
 
+@contextmanager
+def stub_ocr_patch():
+    yield {'applied': True, 'reason': 'test', 'target': 'nltk.edit_distance'}
+
+
 def stub_evalscope(monkeypatch, run_task):
     module = types.ModuleType('evalscope')
     module.__version__ = '1.12.0'
@@ -79,7 +84,7 @@ def stub_evalscope(monkeypatch, run_task):
     monkeypatch.setitem(sys.modules, 'evalscope', module)
     monkeypatch.setattr(runner, 'capture_loaded_dataset', fake_capture)
     monkeypatch.setattr(runner, 'resolve_task_config', lambda raw: {'model': raw['model']})
-    monkeypatch.setattr(runner, 'apply_ocr_compat', lambda: {'applied': False, 'reason': 'test'})
+    monkeypatch.setattr(runner, 'ocr_compat_patch', stub_ocr_patch)
     monkeypatch.setattr(runner, 'report_patch_status', lambda status: None)
     return module
 
@@ -101,14 +106,14 @@ def fake_run_task(*, dataset='gpqa_diamond', score=0.5, fail=False, interrupt=Fa
     return task
 
 
-def execute(tmp_path, monkeypatch, task, *, entry_obj=None, store=None):
+def execute(tmp_path, monkeypatch, task, *, entry_obj=None, store=None, api_key='test-key'):
     stub_evalscope(monkeypatch, task)
     entry_obj = entry_obj or entry()
     store = store or Store(tmp_path / 'results.db')
     output_dir = tmp_path / 'outputs' / 'attempt'
     raw_cfg = {
         'model': MODEL_ID, 'model_id': MODEL_ID, 'api_url': MODEL_CFG['api_url'],
-        'api_key': 'test-key', 'datasets': [entry_obj.dataset], 'work_dir': str(output_dir),
+        'api_key': api_key, 'datasets': [entry_obj.dataset], 'work_dir': str(output_dir),
     }
     result = runner.execute_attempt(
         entry_obj, store=store, attempt_id='attempt-1', run_group='group',
@@ -281,3 +286,214 @@ def test_plan_identity_errors_are_raised_before_running(tmp_path):
     with pytest.raises(ConfigError):
         build_plan(models_cfg=models, suites_doc=suites, data_root=tmp_path,
                    model_names=['nope'], suite_names=['knowledge'], profile='lite')
+
+
+SENTINEL = 'sk-review-SENTINEL-not-a-real-key'
+
+
+def _leaks(text: str) -> bool:
+    return SENTINEL in (text or '')
+
+
+def _secret_entry():
+    entry_obj = entry()
+    entry_obj.model_cfg = {**MODEL_CFG, 'api_key': SENTINEL}
+    return entry_obj
+
+
+def _assert_no_sentinel(result, store, output_dir, tmp_path, capsys):
+    captured = capsys.readouterr()
+    row = store.get_attempt('attempt-1')
+    outcome = read_json(output_dir / 'run_outcome.json')
+    from llmbench.summary import render
+    summary = render(store, tmp_path)
+    assert not _leaks(result.status_reason)
+    assert not _leaks(captured.out) and not _leaks(captured.err)
+    assert not _leaks(row['status_reason']) and not _leaks(row['error'])
+    assert not _leaks(row['config_json']) and not _leaks(row['diagnostics_json'] or '')
+    assert not _leaks(json.dumps(outcome))
+    assert not _leaks(summary)
+
+
+def test_b1_secret_from_task_exception_never_reaches_outputs(tmp_path, monkeypatch, capsys):
+    def task(cfg):
+        raise RuntimeError(f'endpoint rejected {SENTINEL}')
+
+    result, store, output_dir = execute(tmp_path, monkeypatch, task, entry_obj=_secret_entry(),
+                                        api_key=SENTINEL)
+    _assert_no_sentinel(result, store, output_dir, tmp_path, capsys)
+    store.close()
+
+
+def test_b1_secret_from_report_parse_error_is_redacted(tmp_path, monkeypatch, capsys):
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(score=SENTINEL),
+                                        entry_obj=_secret_entry(), api_key=SENTINEL)
+    assert result.execution_status == 'completed'
+    assert 'report_metric_parse_error' in result.status_reason
+    _assert_no_sentinel(result, store, output_dir, tmp_path, capsys)
+    store.close()
+
+
+def test_b1_secret_from_diagnostics_error_is_redacted(tmp_path, monkeypatch, capsys):
+    def boom(output_dir, dataset, *, report_id=None):
+        raise RuntimeError(f'diagnostics failed with {SENTINEL}')
+
+    monkeypatch.setattr(runner, 'collect_output_evidence', boom)
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(),
+                                        entry_obj=_secret_entry(), api_key=SENTINEL)
+    assert result.validity_status == 'invalid'
+    _assert_no_sentinel(result, store, output_dir, tmp_path, capsys)
+    store.close()
+
+
+def test_b1_secret_from_store_failure_is_redacted(tmp_path, monkeypatch, capsys):
+    class BoomStore(Store):
+        def finish_attempt(self, run_id, outcome):
+            raise RuntimeError(f'database write failed with {SENTINEL}')
+
+    store = BoomStore(tmp_path / 'results.db')
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(), entry_obj=_secret_entry(),
+                                        store=store, api_key=SENTINEL)
+    captured = capsys.readouterr()
+    assert result.persisted is False
+    assert not _leaks(result.error)
+    assert not _leaks(captured.err)
+    store.close()
+
+
+def test_b3_primary_metric_without_score_is_unverified_and_visible(tmp_path, monkeypatch):
+    result, store, _ = execute(tmp_path, monkeypatch, fake_run_task(score=None))
+    assert result.validity_status == 'unverified'
+    assert 'primary_metric_missing_score' in result.status_reason
+    assert store.get_attempt('attempt-1')['validity_status'] == 'unverified'
+    from llmbench.summary import render
+    text = render(store, tmp_path)
+    assert 'attempt-1' in text.split('## Diagnostics')[1]
+    assert 'attempt-1' not in text.split('## Diagnostics')[0]
+    store.close()
+
+
+def test_b4_outcome_write_failure_terminates_attempt_and_continues(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def run_task(cfg):
+        dataset = cfg['datasets'][0]
+        calls.append(dataset)
+        write_report(Path(cfg['work_dir']), dataset=dataset, score=0.5)
+        write_jsonl(Path(cfg['work_dir']), 'predictions', dataset=dataset)
+        write_jsonl(Path(cfg['work_dir']), 'reviews', dataset=dataset)
+
+    stub_evalscope(monkeypatch, run_task)
+    real_write = runner.atomic_write_json
+
+    def flaky_write(path, payload):
+        if Path(path).name == 'run_outcome.json':
+            raise OSError(28, 'No space left on device')
+        return real_write(path, payload)
+
+    monkeypatch.setattr(runner, 'atomic_write_json', flaky_write)
+    plan = Plan(data_root=tmp_path, profile='lite', entries=[entry('gpqa_diamond'), entry('math_500')])
+    store = Store(tmp_path / 'results.db')
+    results = runner.run_plan(plan, store=store, repo_dir=tmp_path)
+
+    assert calls == ['gpqa_diamond', 'math_500']  # the next attempt still runs
+    assert len(results) == 2
+    first = results[0]
+    assert first.execution_status == 'failed' and first.validity_status == 'invalid'
+    assert 'evidence_write_error' in first.status_reason
+    row = store.get_attempt(first.run_id)
+    assert row['execution_status'] == 'failed'
+    assert row['validity_status'] == 'invalid'
+    assert row['phase'] == 'evidence'
+    assert runner.batch_exit_code(results) == 1
+    store.close()
+
+
+def test_b4_manifest_write_failure_does_not_call_model(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def run_task(cfg):
+        calls.append(cfg['datasets'][0])
+
+    stub_evalscope(monkeypatch, run_task)
+    import llmbench.evidence as evidence_module
+    real_write = evidence_module.atomic_write_json
+
+    def flaky_write(path, payload):
+        if Path(path).name == 'run_manifest.json':
+            raise OSError(28, 'No space left on device')
+        return real_write(path, payload)
+
+    monkeypatch.setattr(evidence_module, 'atomic_write_json', flaky_write)
+    result, store, _ = execute(tmp_path, monkeypatch, run_task)
+
+    assert calls == []  # no API spend after the evidence path failed
+    assert result.execution_status == 'failed' and result.validity_status == 'invalid'
+    row = store.get_attempt('attempt-1')
+    assert row['execution_status'] == 'failed'
+    diagnostics = json.loads(row['diagnostics_json'])
+    assert diagnostics['attempt_error_phase'] == 'inference'
+    store.close()
+
+
+def test_b5_import_of_semantically_invalid_report_is_rejected(tmp_path, monkeypatch):
+    result, store, output_dir = execute(tmp_path, monkeypatch, fake_run_task(score=0.7))
+    before = store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n']
+    report = output_dir / 'reports' / MODEL_ID / 'gpqa_diamond.json'
+    payload = json.loads(report.read_text(encoding='utf-8'))
+    payload['metrics'] = []
+    report.write_text(json.dumps(payload), encoding='utf-8')
+
+    imported = runner.import_output(output_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert imported['status'] == 'rejected' and imported['committed'] is False
+    assert imported['metrics_kept'] == before
+    assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == before
+    assert read_json(output_dir / 'run_import_rejected.json')['kept_metrics'] == before
+    assert store.get_attempt('attempt-1')['validity_status'] == 'complete'
+    store.close()
+
+
+def test_b5_import_preserves_evaluation_finished_at_and_latest_order(tmp_path, monkeypatch):
+    old_result, store, old_dir = execute(tmp_path, monkeypatch, fake_run_task(score=0.4))
+    # pin the first attempt to a clearly older evaluation time
+    store.conn.execute('UPDATE runs SET finished_at=? WHERE run_id=?',
+                       ('2026-01-01T00:00:00+00:00', old_result.run_id))
+    store.conn.commit()
+    old_finished = store.get_attempt(old_result.run_id)['finished_at']
+
+    second_dir = tmp_path / 'outputs' / 'attempt2'
+    raw_cfg = {'model': MODEL_ID, 'model_id': MODEL_ID, 'api_url': MODEL_CFG['api_url'],
+               'api_key': 'test-key', 'datasets': ['gpqa_diamond'], 'work_dir': str(second_dir)}
+    new_result = runner.execute_attempt(
+        entry(), store=store, attempt_id='attempt-2', run_group='group',
+        output_dir=second_dir, raw_cfg=raw_cfg, resolved_cfg={'model': MODEL_ID},
+        repo_dir=tmp_path, data_root=tmp_path,
+    )
+    new_finished = store.get_attempt(new_result.run_id)['finished_at']
+    assert new_finished and new_finished >= old_finished
+
+    imported = runner.import_output(old_dir, store, repo_dir=tmp_path, data_root=tmp_path)
+    assert imported['status'] == 'committed'
+    row = store.get_attempt(old_result.run_id)
+    assert row['finished_at'] == old_finished  # import does not rewrite history
+    assert row['imported_at'] is not None
+
+    from llmbench.summary import render
+    formal = render(store, tmp_path).split('## Diagnostics')[0]
+    assert new_result.run_id in formal
+    assert old_result.run_id not in formal  # the newer 90% run still wins
+    store.close()
+
+
+def test_c1_generation_config_is_deep_merged(tmp_path):
+    entry_obj = entry()
+    entry_obj.model_cfg = {
+        **MODEL_CFG,
+        'generation_config': {'max_tokens': 100, 'extra_body': {'reasoning': True, 'top_p': 0.9}},
+    }
+    entry_obj.spec = {'generation_config': {'extra_body': {'top_p': 0.5}},
+                      'extra_params': {'build_docker_images': True, 'nested': {'a': 1}}}
+    raw = runner.build_raw_task_config(entry_obj, data_root=tmp_path,
+                                       output_dir=tmp_path / 'out', api_key='k')
+    assert raw['generation_config'] == {'max_tokens': 100, 'extra_body': {'reasoning': True, 'top_p': 0.5}}
+    assert raw['dataset_args']['gpqa_diamond']['extra_params'] == {'build_docker_images': True, 'nested': {'a': 1}}

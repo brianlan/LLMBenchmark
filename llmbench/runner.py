@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__ as TOOL_VERSION
-from .compat import apply_ocr_compat, report_patch_status
+from .compat import ocr_compat_patch, report_patch_status
 from .config import ConfigError, model_config_identity, protocol_identity
 from .evidence import (
     MetricParseError,
@@ -31,6 +31,7 @@ from .store import DuplicateAttemptError, Store
 from .util import (
     atomic_write_json,
     collect_secrets,
+    deep_merge,
     digest,
     now_iso,
     read_json,
@@ -108,10 +109,10 @@ def resolve_task_config(raw_cfg: dict) -> dict:
 
 def build_raw_task_config(entry, *, data_root: Path, output_dir: Path, api_key: str) -> dict:
     model_cfg = entry.model_cfg
-    generation_config = {}
-    for source in (model_cfg.get('generation_config'), entry.spec.get('generation_config')):
-        for key, value in (source or {}).items():
-            generation_config[key] = value
+    generation_config = deep_merge(
+        model_cfg.get('generation_config') or {},
+        entry.spec.get('generation_config') or {},
+    )
     task_cfg = {
         'model': model_cfg['model_id'],
         'model_id': model_cfg.get('report_id') or model_cfg['model_id'],
@@ -133,9 +134,9 @@ def build_raw_task_config(entry, *, data_root: Path, output_dir: Path, api_key: 
     if entry.local_path is not None:
         dataset_args['local_path'] = str(entry.local_path)
     if entry.spec.get('extra_params'):
-        dataset_args['extra_params'] = {
-            **(dataset_args.get('extra_params') or {}), **entry.spec['extra_params']
-        }
+        dataset_args['extra_params'] = deep_merge(
+            dataset_args.get('extra_params') or {}, entry.spec['extra_params']
+        )
     if dataset_args:
         task_cfg['dataset_args'] = {entry.dataset: dataset_args}
     if entry.spec.get('agent_config'):
@@ -191,6 +192,7 @@ def dataset_source(entry, data_root: Path) -> dict:
         'local_path': str(entry.local_path) if entry.local_path else None,
         'pinned': entry.pinned,
         'revision': 'unknown',
+        'revision_source': 'unknown',
     }
     if entry.local_path is not None:
         source_file = entry.local_path / 'source.json'
@@ -200,6 +202,7 @@ def dataset_source(entry, data_root: Path) -> dict:
             except Exception:
                 pinned_source = {}
             source['revision'] = pinned_source.get('revision', 'unknown')
+            source['revision_source'] = pinned_source.get('revision_source', 'pinned source.json')
             source['pinned_source'] = pinned_source
     if not source['dataset_id']:
         try:
@@ -254,9 +257,27 @@ def _manifest_rows_from_details(detail: dict) -> list[dict]:
     return rows
 
 
+def _plain_failure(attempt_id: str, output_dir: Path, message: str, secrets) -> AttemptResult:
+    reason = redact_text(message, secrets)
+    return AttemptResult(attempt_id, output_dir, 'failed', 'invalid', reason, False, reason)
+
+
 def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, output_dir: Path,
                     raw_cfg: dict, resolved_cfg: dict, repo_dir: Path, data_root: Path) -> AttemptResult:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Run one attempt inside a complete error boundary.
+
+    Every exit path terminates the attempt in the database: task errors, report
+    errors, evidence I/O errors and unexpected exceptions all become an explicit
+    failed/invalid result instead of a bare exception or a permanent `running`.
+    """
+    secrets = collect_secrets(raw_cfg)
+    output_dir = Path(output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return _plain_failure(attempt_id, output_dir,
+                              f'evidence_setup_error: {exc.__class__.__name__}: {exc}', secrets)
+
     manifest = build_run_manifest(
         entry, attempt_id=attempt_id, run_group=run_group, output_dir=output_dir,
         raw_cfg=raw_cfg, resolved_cfg=resolved_cfg, repo_dir=repo_dir, data_root=data_root,
@@ -268,36 +289,34 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
     except DuplicateAttemptError:
         return AttemptResult(attempt_id, output_dir, 'failed', 'invalid',
                              'duplicate attempt id', persisted=False)
-    write_run_manifest(output_dir, redact(manifest, collect_secrets(raw_cfg)))
+    except Exception as exc:  # noqa: BLE001
+        return _plain_failure(attempt_id, output_dir,
+                              f'database_unavailable: {exc.__class__.__name__}: {exc}', secrets)
 
     phase = 'inference'
-    task_error = None
     interrupted = False
-    compat_status = apply_ocr_compat()
-    report_patch_status(compat_status)
+    unexpected_error = None
+    compat_status = {'applied': False, 'reason': 'not attempted', 'target': 'nltk.edit_distance'}
+    report = None
+    report_error = None
+    metrics = []
+    output_evidence = {'subsets': {}, 'malformed_lines': []}
 
     def on_samples(raw_dataset, processed_dataset):
         rows, details = build_sample_manifest(raw_dataset, processed_dataset)
         manifest['sample_manifest'] = rows
         manifest['sample_manifest_detail'] = details
         manifest['sample_manifest_identity'] = digest(rows) if rows else None
-        write_run_manifest(output_dir, redact(manifest, collect_secrets(raw_cfg)))
+        write_run_manifest(output_dir, redact(manifest, secrets))
 
-    extra_diagnostics = {'ocr_compat': compat_status}
     try:
-        with capture_loaded_dataset(on_samples):
-            from evalscope import run_task
-            run_task(raw_cfg)
-    except KeyboardInterrupt:
-        interrupted = True
-    except Exception:
-        task_error = traceback.format_exc()
-
-    report = None
-    report_error = None
-    metrics = []
-    phase = 'report'
-    if not interrupted and task_error is None:
+        write_run_manifest(output_dir, redact(manifest, secrets))
+        with ocr_compat_patch() as status:
+            compat_status = status
+            with capture_loaded_dataset(on_samples):
+                from evalscope import run_task
+                run_task(raw_cfg)
+        phase = 'report'
         try:
             report_path, report = locate_report(
                 output_dir, entry.dataset, raw_cfg.get('model_id'),
@@ -311,31 +330,40 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
             report_error = ReportError('metric_parse_error', str(exc))
         except Exception as exc:  # noqa: BLE001 - keep the batch alive, record phase
             report_error = ReportError('parse_error', f'{exc.__class__.__name__}: {exc}')
-
-    output_evidence = {'subsets': {}, 'malformed_lines': []}
-    phase = 'diagnostics'
-    try:
-        output_evidence = collect_output_evidence(output_dir, entry.dataset)
-    except Exception as exc:  # noqa: BLE001
-        extra_diagnostics['diagnostics_error'] = f'{exc.__class__.__name__}: {exc}'
+        phase = 'diagnostics'
+        output_evidence = collect_output_evidence(
+            output_dir, entry.dataset, report_id=raw_cfg.get('model_id')
+        )
+    except KeyboardInterrupt:
+        interrupted = True
+    except Exception:
+        unexpected_error = traceback.format_exc()
 
     manifest_rows = manifest.get('sample_manifest') or []
     coverage_rows = apply_coverage(manifest_rows, output_evidence)
-    manifest_identity = manifest.get('sample_manifest_identity')
-    outcome = assess_run(
-        interrupted=interrupted, task_error=task_error, report_error=report_error,
-        metrics=metrics, execution_summary=(report or {}).get('execution_summary'),
-        manifest_rows=coverage_rows,
-    )
+    if interrupted:
+        outcome = assess_run(interrupted=True)
+    elif unexpected_error:
+        outcome = assess_run(task_error=f'[{phase}] {unexpected_error}')
+    else:
+        outcome = assess_run(
+            report_error=report_error, metrics=metrics,
+            execution_summary=(report or {}).get('execution_summary'),
+            manifest_rows=coverage_rows,
+        )
     comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
     if comparability_reasons and outcome['validity_status'] == VALID and comparability != 'verified':
         outcome['status_reason'] = (outcome['status_reason'] + '; ' if outcome['status_reason'] else '') \
             + 'comparability: ' + '; '.join(comparability_reasons)
 
     diagnostics = summarize_diagnostics(output_evidence)
-    diagnostics.update(extra_diagnostics)
+    diagnostics['ocr_compat'] = compat_status
     diagnostics['comparability_reasons'] = comparability_reasons
     diagnostics['raw_output_dir'] = str(output_dir)
+    if unexpected_error:
+        diagnostics['attempt_error_phase'] = phase
+        if phase == 'diagnostics':
+            diagnostics['diagnostics_error'] = redact_text(unexpected_error, secrets)
 
     if report is not None:
         diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
@@ -358,20 +386,39 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
         'perf_metrics': (report or {}).get('perf_metrics'),
         'primary_metric_identity': (report or {}).get('primary_metric_identity'),
         'protocol_identity': manifest.get('protocol_identity'),
-        'sample_manifest_identity': manifest_identity,
-        'error': redact_text(task_error or '', collect_secrets(raw_cfg)) or None,
+        'sample_manifest_identity': manifest.get('sample_manifest_identity'),
+        'error': redact_text(unexpected_error or '', secrets) or None,
     })
+
+    # B1: every external surface (DB, outcome file, terminal, later summary)
+    # consumes the same fully redacted result object.
+    report_patch_status(compat_status)
+    safe_outcome = redact(outcome, secrets)
     outcome_file = output_dir / 'run_outcome.json'
-    atomic_write_json(outcome_file, redact({**outcome, 'diagnostics': diagnostics}, collect_secrets(raw_cfg)))
+    try:
+        atomic_write_json(outcome_file, safe_outcome)
+    except Exception as exc:  # noqa: BLE001 - file evidence failed, DB must still terminate
+        evidence_error = f'{exc.__class__.__name__}: {exc}'
+        safe_outcome = redact({
+            **safe_outcome,
+            'execution_status': 'failed',
+            'validity_status': 'invalid',
+            'phase': 'evidence',
+            'status_reason': f'evidence_write_error: {evidence_error}',
+            'error': safe_outcome.get('error') or evidence_error,
+        }, secrets)
+        try:
+            atomic_write_json(outcome_file, safe_outcome)
+        except Exception:  # noqa: BLE001 - nothing more we can write
+            pass
 
     persisted = True
     persist_error = None
-    phase = 'persist'
     try:
-        store.finish_attempt(attempt_id, outcome)
+        store.finish_attempt(attempt_id, safe_outcome)
     except Exception as exc:  # noqa: BLE001
         persisted = False
-        persist_error = f'{exc.__class__.__name__}: {exc}'
+        persist_error = redact_text(f'{exc.__class__.__name__}: {exc}', secrets)
         print(f'!!! failed to persist {attempt_id}: {persist_error}\n'
               f'    evidence kept at {output_dir}; re-import with: bench.py import --output-dir {output_dir}',
               file=sys.stderr)
@@ -380,14 +427,16 @@ def execute_attempt(entry, *, store: Store, attempt_id: str, run_group: str, out
         raise BatchInterrupted()
     result = AttemptResult(
         run_id=attempt_id, output_dir=output_dir,
-        execution_status=outcome['execution_status'], validity_status=outcome['validity_status'],
-        status_reason=outcome['status_reason'], persisted=persisted,
-        error=outcome.get('error') or persist_error,
+        execution_status=safe_outcome['execution_status'],
+        validity_status=safe_outcome['validity_status'],
+        status_reason=safe_outcome['status_reason'], persisted=persisted,
+        error=safe_outcome.get('error') or persist_error,
     )
     print(f"--- {entry.dataset} [{attempt_id}] {result.execution_status}/{result.validity_status}"
           f" ({result.status_reason})")
-    if persisted and metrics:
-        top = [row for row in metrics if row['is_primary']] or [row for row in metrics if not row['category']]
+    if persisted and safe_outcome.get('metrics'):
+        rows = safe_outcome['metrics']
+        top = [row for row in rows if row['is_primary']] or [row for row in rows if not row['category']]
         for row in top[:3]:
             score = 'N/A' if row['score'] is None else f"{row['score']:.4f}"
             print(f"    {row['metric_name']} = {score} (n={row['num']})")
@@ -404,19 +453,27 @@ def _pretty_name(dataset: str):
 
 
 def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: Path) -> dict:
-    """Re-parse an existing output directory without calling any model."""
+    """Re-parse an existing output directory without calling any model.
+
+    An import that would downgrade an already accepted run is rejected and
+    audited instead of silently deleting the previous metrics, and it never
+    rewrites the original evaluation completion time.
+    """
     output_dir = Path(output_dir)
     manifest = read_json(output_dir / 'run_manifest.json') if (output_dir / 'run_manifest.json').exists() else None
     if manifest is None:
         raise ConfigError(f'no run_manifest.json under {output_dir}')
     entry = _ManifestEntry(manifest)
     run_id = manifest['attempt_id']
+    secrets = collect_secrets(manifest.get('task_config') or {})
 
     report_path, report = locate_report(
         output_dir, manifest['dataset'], manifest['report_id'], expected_pretty_name=None
     )
     metrics = metric_rows(report)
-    output_evidence = collect_output_evidence(output_dir, manifest['dataset'])
+    output_evidence = collect_output_evidence(
+        output_dir, manifest['dataset'], report_id=manifest.get('report_id')
+    )
     raw_rows = manifest.get('sample_manifest') or _manifest_rows_from_details(
         manifest.get('sample_manifest_detail') or {}
     )
@@ -431,8 +488,23 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
     diagnostics['comparability_reasons'] = comparability_reasons
     diagnostics['primary_metric_identity'] = report.get('primary_metric_identity')
     diagnostics['imported'] = True
+
+    existing = store.get_attempt(run_id)
+    existing_metrics = None
+    if existing is not None:
+        existing_metrics = store.conn.execute(
+            'SELECT COUNT(*) AS n FROM metrics WHERE run_id=?', (run_id,)
+        ).fetchone()['n']
+    # Re-import must not pretend an old evaluation just finished.
+    finished_at = None
+    if existing is not None and existing['finished_at']:
+        finished_at = existing['finished_at']
+    elif manifest.get('created_at'):
+        finished_at = manifest['created_at']
+
     outcome.update({
-        'phase': 'imported', 'finished_at': now_iso(), 'comparability': comparability,
+        'phase': 'imported', 'finished_at': finished_at, 'imported_at': now_iso(),
+        'comparability': comparability,
         'num_requested': (report.get('execution_summary') or {}).get('requested'),
         'num_succeeded': (report.get('execution_summary') or {}).get('succeeded'),
         'num_errored': (report.get('execution_summary') or {}).get('errored'),
@@ -443,12 +515,38 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         'protocol_identity': manifest.get('protocol_identity'),
         'sample_manifest_identity': manifest_identity,
     })
-    if not store.attempt_exists(run_id):
+    safe_outcome = redact(outcome, secrets)
+
+    accepted_existing = {'complete', 'partial'}
+    if existing is not None and existing['validity_status'] in accepted_existing \
+            and safe_outcome['validity_status'] != 'complete':
+        audit = {
+            'run_id': run_id,
+            'rejected_at': now_iso(),
+            'reason': safe_outcome['status_reason'],
+            'new_validity_status': safe_outcome['validity_status'],
+            'kept_validity_status': existing['validity_status'],
+            'kept_metrics': existing_metrics,
+            'report_path': str(report_path),
+        }
+        atomic_write_json(output_dir / 'run_import_rejected.json', redact(audit, secrets))
+        return {
+            'run_id': run_id, 'status': 'rejected', 'committed': False,
+            'validity_status': existing['validity_status'],
+            'new_validity_status': safe_outcome['validity_status'],
+            'reason': safe_outcome['status_reason'],
+            'metrics_kept': existing_metrics,
+        }
+
+    if existing is None:
         store.start_attempt(_manifest_attempt_record(entry, manifest, output_dir, repo_dir))
-    store.finish_attempt(run_id, outcome)
-    atomic_write_json(output_dir / 'run_outcome.json', redact(outcome))
-    return {'run_id': run_id, 'validity_status': outcome['validity_status'],
-            'metrics': len(metrics), 'comparability': comparability}
+    store.finish_attempt(run_id, safe_outcome)
+    atomic_write_json(output_dir / 'run_outcome.json', safe_outcome)
+    return {
+        'run_id': run_id, 'status': 'committed', 'committed': True,
+        'validity_status': safe_outcome['validity_status'],
+        'metrics': len(metrics), 'comparability': comparability,
+    }
 
 
 class _ManifestEntry:
@@ -485,9 +583,11 @@ def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: 
         'started_at': manifest.get('created_at') or now_iso(),
         'evalscope_version': manifest.get('evalscope_version'), 'tool_version': TOOL_VERSION,
         'git_commit': git_commit(repo_dir), 'output_dir': str(output_dir),
-        'config_json': json.dumps(manifest.get('task_config') or {}, ensure_ascii=False, sort_keys=True),
+        'config_json': json.dumps(redact(manifest.get('task_config') or {}), ensure_ascii=False,
+                                  sort_keys=True),
         'protocol_identity': manifest.get('protocol_identity'),
         'sample_manifest_identity': manifest.get('sample_manifest_identity'),
+        'imported_at': now_iso(),
     }
 
 
@@ -529,6 +629,12 @@ def run_plan(plan, *, store: Store, repo_dir: Path, dry_run: bool = False) -> li
                 results.append(AttemptResult(attempt_id, output_dir, 'interrupted', 'invalid',
                                              'interrupted by user', persisted=True))
                 raise
+            except Exception:  # noqa: BLE001 - never let one attempt kill the batch
+                detail = redact_text(traceback.format_exc(), collect_secrets(entry.model_cfg))
+                results.append(AttemptResult(attempt_id, output_dir, 'failed', 'invalid',
+                                             f'runner_error: {detail}', persisted=False,
+                                             error=detail))
+                continue
             results.append(result)
     except KeyboardInterrupt:
         raise BatchInterrupted()

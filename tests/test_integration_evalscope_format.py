@@ -49,6 +49,11 @@ def copy_real_output(output_dir: Path, dataset='gpqa_diamond'):
                 output_dir / 'reviews' / MODEL_ID / f'{dataset}_default.jsonl')
 
 
+@contextmanager
+def stub_ocr_patch():
+    yield {'applied': True, 'reason': 'test', 'target': 'nltk.edit_distance'}
+
+
 def test_real_eval_scope_format_end_to_end(tmp_path, monkeypatch, capsys):
     module = types.ModuleType('evalscope')
     module.__version__ = '1.12.0'
@@ -60,7 +65,7 @@ def test_real_eval_scope_format_end_to_end(tmp_path, monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, 'evalscope', module)
     monkeypatch.setattr(runner, 'capture_loaded_dataset', fake_capture)
     monkeypatch.setattr(runner, 'resolve_task_config', lambda raw: {'model': raw['model']})
-    monkeypatch.setattr(runner, 'apply_ocr_compat', lambda: {'applied': False, 'reason': 'test'})
+    monkeypatch.setattr(runner, 'ocr_compat_patch', stub_ocr_patch)
     monkeypatch.setattr(runner, 'report_patch_status', lambda status: None)
 
     entry = PlanEntry(
