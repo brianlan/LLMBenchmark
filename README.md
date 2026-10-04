@@ -110,23 +110,30 @@ pinned datasets use `limit=1`.
 per attempt:
 
 - `execution_status` — did the attempt itself run: `completed`, `failed`
-  (task exception), `interrupted` (Ctrl+C), `skipped`.
+  (task exception, evidence-write error, runner error), `interrupted`
+  (Ctrl+C), `skipped`.
 - `validity_status` — is the result usable:
   - `complete` — report found, owned by this dataset + model report id,
-    schema parsed, quality metric present, completion verified.
+    schema parsed, the benchmark's **primary quality metric** is identifiable
+    and carries a usable numeric score, completion verified and sample
+    evidence ID-matched.
   - `partial` — some samples errored; shown in the formal table only with
     `--allow-partial`, and then explicitly marked.
-  - `unverified` — evidence insufficient to certify completion (e.g. missing
-    execution summary, requested > manifest selected).
+  - `unverified` — evidence insufficient to certify completion or the primary
+    score (missing execution summary, requested > manifest selected, missing
+    primary metric identity, NULL primary score, aggregate count above
+    succeeded).
   - `invalid` — missing/ambiguous/foreign/corrupt report, no quality metric,
-    all samples failed, interrupted or failed run.
+    non-quality or malformed primary identity, all samples failed, interrupted
+    or failed run.
   - `legacy` — migrated v1 rows with no identity evidence; diagnostics only.
 
 A real score of `0` from a complete run is valid and is recorded as `0`, not as
-"missing" (the DB distinguishes `NULL` from `0`).  The CLI exit code is `0`
-only when every selected attempt is `complete` (or `partial` with
-`--allow-partial`), `1` when some attempt did not meet that contract, `2` for
-configuration/preflight errors, `130` when interrupted by Ctrl+C.
+"missing" (the DB distinguishes `NULL` from `0`); a `NULL` primary score is
+`unverified`, never a formal result.  The CLI exit code is `0` only when every
+selected attempt is `complete` (or `partial` with `--allow-partial`), `1` when
+some attempt did not meet that contract (including a failed summary write),
+`2` for configuration/preflight errors, `130` when interrupted by Ctrl+C.
 
 ## Comparability and evidence
 
@@ -144,9 +151,19 @@ conditions are never silently mixed:
 Before inference, the actual loaded samples are fingerprinted: question content
 (digest), media content (digest of base64 image bytes), and the fully rendered
 request input (digest).  URL-only media is marked as *not verifiable* in the
-manifest instead of being treated as content evidence.  Smoke runs, partial
-runs, unverified runs and legacy rows appear in the diagnostics section of
-`results/summary.md`, never in the formal table.
+manifest instead of being treated as content evidence.  After inference,
+predictions/reviews are read **only from this attempt's own model directory**
+(`predictions/<report_id>`, `reviews/<report_id>`) and compared with the
+manifest on `(subset, sample_id, repeat_id)`: missing, unexpected, duplicate or
+unparsable evidence blocks `verified` and is recorded per subset in the DB.
+Smoke runs, partial runs, unverified runs and legacy rows appear in the
+diagnostics section of `results/summary.md`, never in the formal table.
+
+Every external surface (DB, `run_outcome.json`, terminal, summary) is rendered
+from the same fully redacted result object, so exception text, report parse
+errors and diagnostics errors cannot leak credentials through one path only.
+Provider key patterns (`sk-…`, JWTs) are masked even when the secret value is
+not known to the current process.
 
 Per-attempt diagnostics also extract, from the predictions themselves:
 `stop_reason` distribution (truncation, content filter, unknown/missing stop
@@ -167,9 +184,19 @@ reason), missing usage counters and agent step counts.  Intermediate agent
 Attempt IDs are `<timestamp>_<uuid8>`; each attempt gets its own output
 directory, and `INSERT` never replaces an existing attempt.  Writes are short
 transactions (`WAL` + busy timeout); `finish_attempt` replaces metrics and the
-manifest atomically.  `import` is idempotent and, if re-parsing fails, leaves
-the previous scores untouched.  Schema v2 migrates v1 databases in place:
-legacy rows are preserved and marked `legacy`/`unverified`.
+manifest atomically.  Every attempt has a complete failure boundary: manifest
+writes, inference, report parsing, diagnostics, evidence writes and DB
+persistence all terminate the attempt (`failed`/`invalid`, with the failing
+phase recorded).  A failed `run_outcome.json` write does not abort the batch or
+leave a `running` row; a failed summary write is reported and turns the batch
+exit code into `1`.
+
+`import` is idempotent, never rewrites the original evaluation `finished_at`
+(only `imported_at` is updated) and **rejects** a re-parse that would downgrade
+an already accepted run: the previous metrics stay untouched and the rejection
+is audited in `run_import_rejected.json`.  Imports that repair a non-accepted
+run are committed.  Schema v3 adds empty migration columns for the extra
+coverage evidence.
 
 Each attempt directory keeps the evidence needed to audit or re-import it:
 `run_manifest.json` (redacted plan + config + identities),
@@ -180,15 +207,20 @@ Each attempt directory keeps the evidence needed to audit or re-import it:
 
 - Secrets are only read from the environment variable named in
   `configs/models.yaml`; `api_key`/token-like keys are recursively redacted in
-  manifests, the DB, summaries and exception text (including URL credentials).
+  manifests, the DB, summaries, terminal output and exception text (including
+  URL credentials and provider key patterns).
 - Sandboxed benchmarks refuse to run when Docker is unavailable; there is **no
   fallback to host execution**.
-- `--cleanup-images` deletes only images recorded in this run's own predictions
-  (`swebench/`, `sweb.eval*`, `sweap*` prefixes) that no container is using.
+- `--cleanup-images` deletes only images that this run provably created: they
+  must be referenced by this run's own predictions, unused by any container,
+  and their Docker creation time must not be older than the attempt that
+  referenced them (`docker image inspect`).  Anything unprovable is kept.
 - `--dry-run` has zero side effects: no key access, no database, no Docker, no
   downloads.
 - `prepare` writes to a staging directory and atomically replaces the pinned
-  dataset; the pinned revision (40-hex) and parquet hash are recorded.
+  dataset; the pinned revision (40-hex, with its source recorded) and parquet
+  hash are stored.  Preflight and `prepare` verify the hash and read the
+  parquet back to confirm one readable sample with the expected instance id.
 
 ## Testing
 
@@ -197,13 +229,17 @@ python -m pytest tests/ -q          # offline: no API, Docker or EvalScope neede
 ```
 
 CI (`.github/workflows/tests.yml`) runs exactly this suite after installing
-`requirements-test.txt`.  Tests that need nltk/Levenshtein skip when those
-extras are absent.  The suite covers: metric identity and `NULL` vs `0`,
-report ownership/ambiguity/parse errors, sample manifests and media evidence,
-completion/partial/unverified rules, summary grouping and smoke handling,
-attempt lifecycle and error boundaries (mocked EvalScope), idempotent import,
-v1→v2 migration, image ownership, the scoped OCR patch semantics, and
-`prepare` atomic replacement.
+`requirements-test.txt`.  Tests that need nltk/Levenshtein or pyarrow skip when
+those extras are absent.  The suite covers: metric identity and `NULL` vs `0`,
+report ownership/ambiguity/parse errors, primary-metric validity, sample
+manifests and media evidence, ID-set coverage (missing/extra/duplicate/
+malformed, other-model files), completion/partial/unverified rules, summary
+grouping and smoke handling, attempt lifecycle and error boundaries (mocked
+EvalScope, including manifest/outcome write failures), secret-sentinel
+redaction through DB/stdout/outcome/summary, idempotent and rejecting import
+with stable evaluation times, v1→v2→v3 migration, recursive config merging,
+protocol storage invariance, image ownership proof, the scoped OCR patch
+semantics, and `prepare` hash/content verification.
 
 ## Dataset status
 
@@ -224,4 +260,6 @@ met.
   `core: true` for defaults, `full_per_subset_limit` for expensive full runs,
   `requires`/`requires_sandbox` for preflight checks, and use pass-through
   `dataset_args` / `extra_params` / `generation_config` / `agent_config` for
-  EvalScope-specific options.
+  EvalScope-specific options.  Nested dicts are merged recursively (model
+  defaults are preserved when a dataset overrides one nested field); lists and
+  scalars replace the base value.

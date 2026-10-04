@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .config import validate_pinned_dir
+from .config import validate_pinned_content, validate_pinned_dir
 from .util import file_digest, now_iso
 
 DJANGO_DATASET_NAME = 'swe_bench_verified_django1'
@@ -33,12 +33,15 @@ def prepare_django_dataset(data_root: Path, *, force: bool = False) -> dict:
     out_dir = Path(data_root) / 'pinned' / DJANGO_DATASET_NAME
     if out_dir.exists() and not force:
         ok, reason = validate_pinned_dir(out_dir, DJANGO_INSTANCE_ID)
-        if ok:
-            return {'status': 'exists', 'path': str(out_dir), 'reason': reason}
-        # An incomplete/legacy pinned dir is rebuilt instead of being trusted.
+        content_ok, content_reason = validate_pinned_content(out_dir, DJANGO_INSTANCE_ID)
+        if ok and content_ok:
+            return {'status': 'exists', 'path': str(out_dir), 'reason': content_reason}
+        # An incomplete, corrupt or checksum-mismatching pinned dir is rebuilt
+        # instead of being trusted.
 
     dataset = datasets.load_dataset(SWE_BENCH_REPO, split='test')
     revision = _cached_revision(dataset)
+    revision_source = 'hf-datasets cache snapshot path' if revision != 'unknown' else 'unknown'
     pinned = dataset.filter(lambda record: record['instance_id'] == DJANGO_INSTANCE_ID)
     if len(pinned) != 1:
         raise RuntimeError(f'expected exactly one {DJANGO_INSTANCE_ID}, found {len(pinned)}')
@@ -53,6 +56,7 @@ def prepare_django_dataset(data_root: Path, *, force: bool = False) -> dict:
         source = {
             'repo': SWE_BENCH_REPO,
             'revision': revision,
+            'revision_source': revision_source,
             'instance_ids': [DJANGO_INSTANCE_ID],
             'parquet_sha256': file_digest(parquet_path),
             'created_at': now_iso(),
@@ -61,6 +65,9 @@ def prepare_django_dataset(data_root: Path, *, force: bool = False) -> dict:
         ok, reason = validate_pinned_dir(staging)
         if not ok:
             raise RuntimeError(f'prepared dataset failed validation: {reason}')
+        content_ok, content_reason = validate_pinned_content(staging, DJANGO_INSTANCE_ID)
+        if not content_ok:
+            raise RuntimeError(f'prepared dataset failed content validation: {content_reason}')
 
         backup = out_dir.with_name(out_dir.name + '.old')
         if backup.exists():

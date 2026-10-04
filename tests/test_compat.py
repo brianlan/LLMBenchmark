@@ -1,9 +1,11 @@
+import importlib
+
 import pytest
 
 nltk = pytest.importorskip('nltk')
 Levenshtein = pytest.importorskip('Levenshtein')
 
-from llmbench.compat import apply_ocr_compat, ocr_compat_available  # noqa: E402
+from llmbench.compat import ocr_compat_available, ocr_compat_patch  # noqa: E402
 
 
 def reference_distance(a: str, b: str) -> int:
@@ -21,21 +23,24 @@ def reference_distance(a: str, b: str) -> int:
     return previous[-1]
 
 
-def test_apply_patch_targets_only_nltk_edit_distance():
-    import importlib
-
+def test_patch_is_scoped_and_restored():
     metrics_distance_module = importlib.import_module('nltk.metrics.distance')
-    original = metrics_distance_module.edit_distance
-    status = apply_ocr_compat()
-    assert status['applied'] is True
-    assert status['target'] == 'nltk.edit_distance'
-    assert nltk.edit_distance is Levenshtein.distance
-    # the underlying nltk implementation is untouched, the patch is call-site scoped
-    assert metrics_distance_module.edit_distance is original
+    original_top_level = nltk.edit_distance
+    original_impl = metrics_distance_module.edit_distance
+
+    with ocr_compat_patch() as status:
+        assert status['applied'] is True
+        assert status['target'] == 'nltk.edit_distance'
+        assert nltk.edit_distance is Levenshtein.distance
+        # the underlying nltk implementation is untouched, the patch is call-site scoped
+        assert metrics_distance_module.edit_distance is original_impl
+
+    # the global patch does not leak past the context
+    assert nltk.edit_distance is original_top_level
+    assert metrics_distance_module.edit_distance is original_impl
 
 
 def test_patched_function_matches_reference_semantics():
-    apply_ocr_compat()
     cases = [
         ('kitten', 'sitting'),
         ('', 'abc'),
@@ -44,8 +49,9 @@ def test_patched_function_matches_reference_semantics():
         ('café', 'cafe'),
         ('a' * 2500, 'a' * 2499 + 'b'),  # nltk >= 3.9 refuses >2000 chars
     ]
-    for left, right in cases:
-        assert nltk.edit_distance(left, right) == reference_distance(left, right)
+    with ocr_compat_patch():
+        for left, right in cases:
+            assert nltk.edit_distance(left, right) == reference_distance(left, right)
 
 
 def test_availability_probe_reports_importable_dependencies():

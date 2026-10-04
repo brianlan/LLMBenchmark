@@ -5,6 +5,7 @@ import pytest
 
 from llmbench.config import (
     ConfigError,
+    PlanEntry,
     build_plan,
     check_entry_requirements,
     endpoint_identity,
@@ -153,6 +154,10 @@ def test_protocol_identity_axes():
     assert base != protocol_identity({**resolved, 'agent_config': {'mode': 'native', 'max_steps': 100}})
     # sample count lives in the manifest identity, not the protocol identity
     assert base == protocol_identity({**resolved, 'limit': 5})
+    # pure storage locations are not part of the protocol
+    assert base == protocol_identity({**resolved, 'dataset_dir': '/disk-a/datasets'})
+    assert protocol_identity({**resolved, 'dataset_dir': '/disk-a/datasets'}) == protocol_identity(
+        {**resolved, 'dataset_dir': '/disk-b/datasets'})
     # dataset behavior knobs are protocol
     assert base != protocol_identity({**resolved, 'dataset_args': {
         'gpqa_diamond': {'extra_params': {'x': 1}}}})
@@ -188,6 +193,29 @@ def test_preflight_checks_keys_modules_sandbox_and_pinned(tmp_path, monkeypatch)
     pinned_entry = [entry for entry in entries if entry.dataset == 'swe_bench_verified_agentic'][0]
     errors = check_entry_requirements(pinned_entry, check_keys=False, check_docker=True, check_pinned=True)
     assert any('prepare' in error for error in errors)
+
+
+def test_preflight_rejects_pinned_parquet_that_is_not_readable(tmp_path, monkeypatch):
+    import hashlib
+
+    pinned = tmp_path / 'pinned' / 'ds'
+    pinned.mkdir(parents=True)
+    parquet = pinned / 'test-00000-of-00001.parquet'
+    parquet.write_bytes(b'not-parquet')
+    (pinned / 'source.json').write_text(json.dumps({
+        'instance_ids': ['django__django-10097'], 'revision': 'a' * 40,
+        'parquet_sha256': hashlib.sha256(b'not-parquet').hexdigest(),
+    }))
+    from llmbench.config import validate_pinned_dir
+    assert validate_pinned_dir(pinned, 'django__django-10097')[0] is True  # hash matches
+
+    entry = PlanEntry(
+        model_alias='minimax', model_cfg=MODELS['minimax'], suite='swe',
+        dataset='swe_bench_verified_agentic', spec={}, profile='smoke', limit=1,
+        batch_size=1, pinned=True, local_path=pinned, status='tested',
+    )
+    errors = check_entry_requirements(entry, check_keys=False, check_docker=False, check_pinned=True)
+    assert any('parquet' in error or 'pyarrow' in error for error in errors)
 
 
 def test_sandbox_disabled_refuses_host_fallback(tmp_path):

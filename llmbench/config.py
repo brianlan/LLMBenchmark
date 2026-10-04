@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from .util import digest, redact_text
+from .util import deep_merge as _deep_merge, digest, file_digest, redact_text
 
 SUITE_NAMES = ('knowledge', 'swe', 'vision')
 PROFILE_NAMES = ('smoke', 'lite', 'full')
@@ -214,6 +214,8 @@ def model_config_identity(model_alias: str, model_cfg: dict) -> str:
 PROTOCOL_EXCLUDED_KEYS = {
     'model', 'model_id', 'api_url', 'api_key', 'work_dir', 'no_timestamp', 'use_cache',
     'collect_perf', 'ignore_errors', 'limit', 'eval_batch_size', 'output_dir',
+    # pure storage locations; dataset content identity is covered by the manifest
+    'dataset_dir',
 }
 
 
@@ -277,7 +279,39 @@ def validate_pinned_dir(path: Path, expected_instance: str | None = None):
         return False, f'pinned dataset must contain exactly one instance, got {instance_ids}'
     if expected_instance and instance_ids != [expected_instance]:
         return False, f'pinned dataset is {instance_ids}, expected [{expected_instance}]'
+    recorded_hash = source.get('parquet_sha256')
+    if recorded_hash:
+        actual_hash = file_digest(parquet)
+        if actual_hash != recorded_hash:
+            return False, (
+                f'pinned parquet checksum mismatch: recorded {recorded_hash[:12]}, '
+                f'actual {actual_hash[:12]}'
+            )
     return True, source.get('revision', 'unknown')
+
+
+def validate_pinned_content(path: Path, expected_instance: str | None = None):
+    """Verify the pinned parquet is readable and actually contains the instance."""
+    parquet = Path(path) / 'test-00000-of-00001.parquet'
+    if not parquet.exists():
+        return False, f'pinned dataset has no test parquet: {path}'
+    try:
+        import pyarrow.parquet as pq
+    except Exception as exc:  # noqa: BLE001 - pyarrow is an extras dependency
+        return False, f'pyarrow is required to verify pinned parquet ({exc.__class__.__name__})'
+    try:
+        table = pq.read_table(parquet)
+    except Exception as exc:  # noqa: BLE001
+        return False, f'pinned parquet is not readable: {exc.__class__.__name__}: {exc}'
+    if table.num_rows != 1:
+        return False, f'pinned dataset must contain exactly one sample, found {table.num_rows}'
+    if expected_instance:
+        if 'instance_id' not in table.column_names:
+            return False, 'pinned parquet has no instance_id column'
+        values = table.column('instance_id').to_pylist()
+        if values != [expected_instance]:
+            return False, f'pinned instance_id is {values}, expected [{expected_instance}]'
+    return True, 'content verified'
 
 
 def check_entry_requirements(entry: PlanEntry, *, check_keys: bool, check_docker: bool,
@@ -308,6 +342,10 @@ def check_entry_requirements(entry: PlanEntry, *, check_keys: bool, check_docker
         ok, reason = validate_pinned_dir(entry.local_path)
         if not ok:
             errors.append(f'{entry.dataset}: {reason}; run `bench.py prepare` first')
+        else:
+            content_ok, content_reason = validate_pinned_content(entry.local_path)
+            if not content_ok:
+                errors.append(f'{entry.dataset}: {content_reason}; run `bench.py prepare` first')
     return errors
 
 
