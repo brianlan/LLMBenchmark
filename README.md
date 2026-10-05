@@ -56,6 +56,31 @@ Network is usually reachable directly; add
 if a download stalls.  Docker pulls already use the daemon proxy configured in
 `/etc/docker/daemon.json`.
 
+### NLTK data (ifeval, OCRBench-v2)
+
+Two datasets need NLTK corpora that are not Python packages:
+
+- `ifeval` tokenizes sentences with `punkt_tab` (and `punkt`);
+- `ocr_bench_v2`'s METEOR metric needs `wordnet` and `omw-1.4`.
+
+When a corpus is missing EvalScope logs `Resource '<name>' not found` and
+continues with the next sample, so the affected dataset still "completes" but
+its score is computed from incomplete evidence.  Install them once:
+
+```bash
+python - <<'PY'
+import nltk
+for package in ('punkt', 'punkt_tab', 'wordnet', 'omw-1.4'):
+    nltk.download(package, quiet=True)
+PY
+```
+
+NLTK stores the files under `~/nltk_data`, which is in its default search path,
+so no environment variable is needed.  Behind a proxy, NLTK 3.10 refuses
+proxied downloads unless the proxy is trusted: set `https_proxy` and prefix the
+command with `NLTK_ALLOW_PROXIED_URLOPEN=1`.  After installing, re-run the
+affected dataset to replace the incomplete scores.
+
 ## Usage
 
 ```bash
