@@ -503,6 +503,15 @@ def _pretty_name(dataset: str):
         return None
 
 
+def _clean_identity(value):
+    """Normalize an identity value: missing, None, empty and blank all mean unknown."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def _identity_conflicts(manifest: dict, existing, effective_manifest_identity=None) -> list:
     """Compare immutable run identity between the manifest and the DB row.
 
@@ -514,19 +523,20 @@ def _identity_conflicts(manifest: dict, existing, effective_manifest_identity=No
     """
     existing_keys = set(existing.keys()) if hasattr(existing, 'keys') else set()
     effective = {
-        'dataset': manifest.get('dataset'),
-        'suite': manifest.get('suite'),
-        'model_id': manifest.get('model_id') or manifest.get('report_id'),
-        'model_config_identity': manifest.get('model_config_identity'),
-        'protocol_identity': manifest.get('protocol_identity'),
-        'sample_manifest_identity': effective_manifest_identity,
+        'dataset': _clean_identity(manifest.get('dataset')),
+        'suite': _clean_identity(manifest.get('suite')),
+        'model_id': _clean_identity(manifest.get('model_id'))
+        or _clean_identity(manifest.get('report_id')),
+        'model_config_identity': _clean_identity(manifest.get('model_config_identity')),
+        'protocol_identity': _clean_identity(manifest.get('protocol_identity')),
+        'sample_manifest_identity': _clean_identity(effective_manifest_identity),
     }
     conflicts = []
     for field, new_value in effective.items():
-        old_value = existing[field] if field in existing_keys else None
+        old_value = _clean_identity(existing[field]) if field in existing_keys else None
         if not old_value:
             continue
-        if new_value is None or str(new_value) == '':
+        if new_value is None:
             conflicts.append(f'{field}: db={old_value} manifest=<missing>')
         elif str(new_value) != str(old_value):
             conflicts.append(f'{field}: db={old_value} manifest={new_value}')
@@ -586,7 +596,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         # instead of a formal result.
         unverifiable = []
         for field in ('model_id', 'model_config_identity', 'protocol_identity'):
-            if not manifest.get(field):
+            if not _clean_identity(manifest.get(field)):
                 unverifiable.append(f'{field}: <missing>')
         if manifest_identity is None:
             unverifiable.append('sample_manifest_identity: <missing>')
@@ -629,8 +639,8 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'sample_manifest_identity': manifest_identity,
             # Actual API model identity: persisted only when the artifact states
             # it; an earlier unverified import can be repaired by a later one.
-            'model_id': manifest.get('model_id'),
-            'model_config_identity': manifest.get('model_config_identity'),
+            'model_id': _clean_identity(manifest.get('model_id')),
+            'model_config_identity': _clean_identity(manifest.get('model_config_identity')),
         })
         safe_outcome = redact(outcome, secrets)
     except Exception as exc:  # noqa: BLE001 - parse failures are redacted at this boundary

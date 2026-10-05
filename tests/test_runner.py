@@ -952,14 +952,28 @@ def test_first_import_rejects_declared_sample_identity_mismatch(tmp_path):
         store.close()
 
 
-def test_first_import_without_model_identity_is_not_certified(tmp_path):
+@pytest.mark.parametrize('blank_state', [
+    'missing', 'none', 'empty', 'empty_model_id', 'empty_config_identity',
+])
+def test_first_import_without_model_identity_is_not_certified(tmp_path, blank_state):
     from llmbench.summary import render
 
     attempt = tmp_path / 'attempt'
     _write_standalone_attempt(attempt, 'run-first-noid', model_id='Model-A', score=0.8)
     manifest = json.loads((attempt / 'run_manifest.json').read_text(encoding='utf-8'))
-    manifest.pop('model_id')
-    manifest.pop('model_config_identity')
+    if blank_state == 'missing':
+        manifest.pop('model_id')
+        manifest.pop('model_config_identity')
+    elif blank_state == 'none':
+        manifest['model_id'] = None
+        manifest['model_config_identity'] = None
+    elif blank_state == 'empty':
+        manifest['model_id'] = ''
+        manifest['model_config_identity'] = ''
+    elif blank_state == 'empty_model_id':
+        manifest['model_id'] = ''
+    else:
+        manifest['model_config_identity'] = ''
     manifest['sample_manifest'] = [{
         'subset': 'default', 'selected': 1, 'sample_ids': ['0'],
         'question_digest': 'qd', 'media_digest': 'md', 'input_digest': 'id',
@@ -974,13 +988,16 @@ def test_first_import_without_model_identity_is_not_certified(tmp_path):
         assert result['status'] == 'committed'
         assert result['validity_status'] == 'unverified'
         row = store.get_attempt('run-first-noid')
-        assert row['model_id'] is None and row['model_config_identity'] is None
+        if blank_state in ('missing', 'none', 'empty', 'empty_model_id'):
+            assert not (row['model_id'] or '')
+        if blank_state in ('missing', 'none', 'empty', 'empty_config_identity'):
+            assert not (row['model_config_identity'] or '')
         assert 'import_identity_unverifiable' in row['status_reason']
         summary = render(store, tmp_path)
         assert 'run-first-noid' in summary.split('## Diagnostics')[1]
 
         # a later, complete artifact repairs the same run instead of staying
-        # permanently uncertifiable
+        # permanently uncertifiable; the repaired identity must be persisted
         good = tmp_path / 'good'
         _write_standalone_attempt(good, 'run-first-noid', model_id='Model-A', score=0.8)
         _mutate_manifest(good, sample_manifest=manifest['sample_manifest'],
@@ -991,8 +1008,21 @@ def test_first_import_without_model_identity_is_not_certified(tmp_path):
         assert repaired['status'] == 'committed'
         row = store.get_attempt('run-first-noid')
         assert row['model_id'] == 'Model-A'
+        assert row['model_config_identity'] == 'mci-Model-A'
         assert (row['validity_status'], row['comparability']) == ('complete', 'verified')
         assert 'run-first-noid' in render(store, tmp_path).split('## Diagnostics')[0]
+
+        # the repaired identity now protects the run from a different model
+        other = tmp_path / 'other'
+        _write_standalone_attempt(other, 'run-first-noid', model_id='Model-B', score=0.2)
+        _mutate_manifest(other, sample_manifest=manifest['sample_manifest'],
+                         sample_manifest_identity=manifest['sample_manifest_identity'])
+        write_jsonl(other, 'predictions', dataset='gpqa_diamond', report_id='Model-B', count=1)
+        write_jsonl(other, 'reviews', dataset='gpqa_diamond', report_id='Model-B', count=1)
+        conflict = runner.import_output(other, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert conflict['status'] == 'rejected'
+        assert store.get_attempt('run-first-noid')['model_id'] == 'Model-A'
+        assert _primary_score(store, 'run-first-noid') == 0.8
     finally:
         store.close()
 

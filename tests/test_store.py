@@ -230,3 +230,21 @@ def test_finish_attempt_fills_missing_identity_but_never_overwrites(tmp_path):
     row = store.get_attempt('run-keep')
     assert row['model_id'] == 'm' and row['model_config_identity'] == 'mid'
     store.close()
+
+
+def test_finish_attempt_repairs_empty_string_identity(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    record = attempt_record('run-empty')
+    record['model_id'] = ''
+    record['model_config_identity'] = ''
+    record['protocol_identity'] = ''
+    store.start_attempt(record)
+    filled = outcome(0.5)
+    filled['model_id'] = 'Actual-Model'
+    filled['model_config_identity'] = 'actual-mid'
+    store.finish_attempt('run-empty', filled)
+    row = store.get_attempt('run-empty')
+    assert row['model_id'] == 'Actual-Model'
+    assert row['model_config_identity'] == 'actual-mid'
+    assert row['protocol_identity'] == 'pid'
+    store.close()
