@@ -207,3 +207,26 @@ def test_create_attempt_with_outcome_writes_single_row(tmp_path):
     assert row['finished_at'] == '2026-01-01T00:01:00'
     assert store.conn.execute('SELECT COUNT(*) AS n FROM metrics').fetchone()['n'] == 1
     store.close()
+
+
+def test_finish_attempt_fills_missing_identity_but_never_overwrites(tmp_path):
+    store = Store(tmp_path / 'results.db')
+    record = attempt_record('run-fill')
+    record['model_id'] = None
+    record['model_config_identity'] = None
+    store.start_attempt(record)
+    filled = outcome(0.5)
+    filled['model_id'] = 'Actual-Model'
+    filled['model_config_identity'] = 'actual-mid'
+    store.finish_attempt('run-fill', filled)
+    row = store.get_attempt('run-fill')
+    assert row['model_id'] == 'Actual-Model' and row['model_config_identity'] == 'actual-mid'
+
+    store.start_attempt(attempt_record('run-keep'))
+    replacement = outcome(0.5)
+    replacement['model_id'] = 'Other-Model'
+    replacement['model_config_identity'] = 'other-mid'
+    store.finish_attempt('run-keep', replacement)
+    row = store.get_attempt('run-keep')
+    assert row['model_id'] == 'm' and row['model_config_identity'] == 'mid'
+    store.close()

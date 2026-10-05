@@ -292,6 +292,8 @@ class Store:
                        num_errored=?, incomplete=?, report_path=?, diagnostics_json=?,
                        perf_json=?, error=?, protocol_identity=COALESCE(?, protocol_identity),
                        sample_manifest_identity=COALESCE(?, sample_manifest_identity),
+                       model_id=COALESCE(model_id, ?),
+                       model_config_identity=COALESCE(model_config_identity, ?),
                        primary_metric_json=?, imported_at=COALESCE(?, imported_at)
                    WHERE run_id=?""",
                 (outcome.get('execution_status'), outcome.get('validity_status'),
@@ -302,6 +304,7 @@ class Store:
                  outcome.get('report_path'), _dumps(outcome.get('diagnostics')),
                  _dumps(outcome.get('perf_metrics')), outcome.get('error'),
                  outcome.get('protocol_identity'), outcome.get('sample_manifest_identity'),
+                 outcome.get('model_id'), outcome.get('model_config_identity'),
                  _dumps(outcome.get('primary_metric_identity')),
                  outcome.get('imported_at'),
                  run_id),

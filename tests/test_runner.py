@@ -925,3 +925,90 @@ def test_identity_conflict_cli_output_is_redacted(tmp_path, capsys):
     assert exit_code == 1
     assert OPAQUE_SECRET not in captured.out and OPAQUE_SECRET not in captured.err
     assert 'import rejected' in captured.err
+
+
+def test_first_import_rejects_declared_sample_identity_mismatch(tmp_path):
+    from llmbench.summary import render
+
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-first-bad', model_id='Model-A', score=0.8)
+    rows = [{'subset': 'gpqa_diamond', 'sample_ids': ['1', '2']}]
+    _mutate_manifest(attempt, sample_manifest=rows, sample_manifest_identity='0' * 64)
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        first = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert first['status'] == 'rejected' and first['committed'] is False
+        assert 'declared=' in first['reason']
+        # the same unchanged artifact must not become certifiable on a later try either
+        second = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert second['status'] == 'rejected'
+        assert store.attempt_exists('run-first-bad') is False
+        assert store.conn.execute('SELECT COUNT(*) AS n FROM runs').fetchone()['n'] == 0
+        assert 'run-first-bad' not in render(store, tmp_path)
+        audit = json.loads((attempt / 'run_import_rejected.json').read_text(encoding='utf-8'))
+        assert audit['kind'] == 'identity_conflict' and audit['kept_validity_status'] is None
+    finally:
+        store.close()
+
+
+def test_first_import_without_model_identity_is_not_certified(tmp_path):
+    from llmbench.summary import render
+
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-first-noid', model_id='Model-A', score=0.8)
+    manifest = json.loads((attempt / 'run_manifest.json').read_text(encoding='utf-8'))
+    manifest.pop('model_id')
+    manifest.pop('model_config_identity')
+    manifest['sample_manifest'] = [{
+        'subset': 'default', 'selected': 1, 'sample_ids': ['0'],
+        'question_digest': 'qd', 'media_digest': 'md', 'input_digest': 'id',
+        'media_evidence': True,
+    }]
+    manifest['sample_manifest_identity'] = digest(manifest['sample_manifest'])
+    (attempt / 'run_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        result = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert result['status'] == 'committed'
+        assert result['validity_status'] == 'unverified'
+        row = store.get_attempt('run-first-noid')
+        assert row['model_id'] is None and row['model_config_identity'] is None
+        assert 'import_identity_unverifiable' in row['status_reason']
+        summary = render(store, tmp_path)
+        assert 'run-first-noid' in summary.split('## Diagnostics')[1]
+
+        # a later, complete artifact repairs the same run instead of staying
+        # permanently uncertifiable
+        good = tmp_path / 'good'
+        _write_standalone_attempt(good, 'run-first-noid', model_id='Model-A', score=0.8)
+        _mutate_manifest(good, sample_manifest=manifest['sample_manifest'],
+                         sample_manifest_identity=manifest['sample_manifest_identity'])
+        write_jsonl(good, 'predictions', dataset='gpqa_diamond', report_id='Model-A', count=1)
+        write_jsonl(good, 'reviews', dataset='gpqa_diamond', report_id='Model-A', count=1)
+        repaired = runner.import_output(good, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert repaired['status'] == 'committed'
+        row = store.get_attempt('run-first-noid')
+        assert row['model_id'] == 'Model-A'
+        assert (row['validity_status'], row['comparability']) == ('complete', 'verified')
+        assert 'run-first-noid' in render(store, tmp_path).split('## Diagnostics')[0]
+    finally:
+        store.close()
+
+
+def test_first_import_with_consistent_identity_is_certified(tmp_path):
+    attempt = tmp_path / 'attempt'
+    _write_standalone_attempt(attempt, 'run-first-ok', model_id='Model-A', score=0.8)
+    rows = [{'subset': 'gpqa_diamond', 'selected': 1, 'sample_ids': ['1']}]
+    _mutate_manifest(attempt, sample_manifest=rows, sample_manifest_identity=digest(rows))
+
+    store = Store(tmp_path / 'results.db')
+    try:
+        result = runner.import_output(attempt, store, repo_dir=tmp_path, data_root=tmp_path)
+        assert result['status'] == 'committed' and result['validity_status'] == 'complete'
+        row = store.get_attempt('run-first-ok')
+        assert row['sample_manifest_identity'] == digest(rows)
+        assert 'unverifiable' not in (row['status_reason'] or '')
+    finally:
+        store.close()

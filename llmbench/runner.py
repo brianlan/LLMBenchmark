@@ -42,6 +42,7 @@ from .util import (
 )
 from .validation import (
     COMPARABILITY_UNKNOWN,
+    UNVERIFIED,
     VALID,
     assess_comparability,
     assess_run,
@@ -579,6 +580,23 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             report_error=None, metrics=metrics,
             execution_summary=report.get('execution_summary'), manifest_rows=coverage_rows,
         )
+        # Phase 1 artifact self-check: a missing or inconsistent identity in the
+        # artifact itself must not become "certified" just because the database is
+        # empty.  Unrecoverable identity is kept as an unverified diagnostic row
+        # instead of a formal result.
+        unverifiable = []
+        for field in ('model_id', 'model_config_identity', 'protocol_identity'):
+            if not manifest.get(field):
+                unverifiable.append(f'{field}: <missing>')
+        if manifest_identity is None:
+            unverifiable.append('sample_manifest_identity: <missing>')
+        elif declared_identity and computed_identity is None:
+            unverifiable.append('sample_manifest_identity: declared without manifest content')
+        if unverifiable:
+            original = outcome['status_reason']
+            reason = 'import_identity_unverifiable: ' + '; '.join(unverifiable)
+            outcome['validity_status'] = UNVERIFIED
+            outcome['status_reason'] = f'{original}; {reason}' if original else reason
         comparability, comparability_reasons = assess_comparability(coverage_rows, output_evidence)
         diagnostics = summarize_diagnostics(output_evidence)
         diagnostics['comparability_reasons'] = comparability_reasons
@@ -609,6 +627,10 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'primary_metric_identity': report.get('primary_metric_identity'),
             'protocol_identity': manifest.get('protocol_identity'),
             'sample_manifest_identity': manifest_identity,
+            # Actual API model identity: persisted only when the artifact states
+            # it; an earlier unverified import can be repaired by a later one.
+            'model_id': manifest.get('model_id'),
+            'model_config_identity': manifest.get('model_config_identity'),
         })
         safe_outcome = redact(outcome, secrets)
     except Exception as exc:  # noqa: BLE001 - parse failures are redacted at this boundary
@@ -618,10 +640,25 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'reason': redact_text(f'{exc.__class__.__name__}: {exc}', secrets),
         }
 
+    if identity_inconsistent:
+        conflicts = [
+            f'sample_manifest_identity: declared={declared_identity} computed={computed_identity}']
+        audit = {
+            'run_id': run_id, 'kind': 'identity_conflict', 'rejected_at': now_iso(),
+            'conflicts': conflicts,
+            'kept_validity_status': existing['validity_status'] if existing is not None else None,
+            'kept_comparability': existing['comparability'] if existing is not None else None,
+            'kept_metrics': existing_metrics,
+            'report_path': str(report_path),
+        }
+        _write_audit(output_dir, 'run_import_rejected.json', audit, secrets)
+        return redact({
+            'run_id': run_id, 'status': 'rejected', 'committed': False,
+            'reason': 'identity_conflict: ' + '; '.join(conflicts),
+            'conflicts': conflicts,
+        }, secrets)
+
     conflicts = _identity_conflicts(manifest, existing, manifest_identity) if existing is not None else []
-    if existing is not None and identity_inconsistent:
-        conflicts.append(
-            f'sample_manifest_identity: declared={declared_identity} computed={computed_identity}')
     if conflicts:
         audit = {
             'run_id': run_id, 'kind': 'identity_conflict', 'rejected_at': now_iso(),
@@ -689,7 +726,8 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         if existing is None:
             # One transaction: a first import can never leave a `running` row.
             store.create_attempt_with_outcome(
-                _manifest_attempt_record(entry, manifest, output_dir, repo_dir), safe_outcome
+                _manifest_attempt_record(entry, manifest, output_dir, repo_dir, manifest_identity),
+                safe_outcome
             )
         else:
             store.finish_attempt(run_id, safe_outcome)
@@ -729,7 +767,8 @@ class _ManifestEntry:
         self.status = 'imported'
 
 
-def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: Path) -> dict:
+def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: Path,
+                             manifest_identity=None) -> dict:
     return {
         'run_id': manifest['attempt_id'], 'run_group': manifest.get('run_group'),
         'model_alias': entry.model_alias, 'model_id': entry.model_cfg['model_id'],
@@ -744,7 +783,7 @@ def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: 
         'config_json': json.dumps(redact(manifest.get('task_config') or {}), ensure_ascii=False,
                                   sort_keys=True),
         'protocol_identity': manifest.get('protocol_identity'),
-        'sample_manifest_identity': manifest.get('sample_manifest_identity'),
+        'sample_manifest_identity': manifest_identity or manifest.get('sample_manifest_identity'),
         'imported_at': now_iso(),
     }
 
