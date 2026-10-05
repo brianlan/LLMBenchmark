@@ -954,6 +954,7 @@ def test_first_import_rejects_declared_sample_identity_mismatch(tmp_path):
 
 @pytest.mark.parametrize('blank_state', [
     'missing', 'none', 'empty', 'empty_model_id', 'empty_config_identity',
+    'blank', 'tab',
 ])
 def test_first_import_without_model_identity_is_not_certified(tmp_path, blank_state):
     from llmbench.summary import render
@@ -970,6 +971,12 @@ def test_first_import_without_model_identity_is_not_certified(tmp_path, blank_st
     elif blank_state == 'empty':
         manifest['model_id'] = ''
         manifest['model_config_identity'] = ''
+    elif blank_state == 'blank':
+        manifest['model_id'] = '   '
+        manifest['model_config_identity'] = '   '
+    elif blank_state == 'tab':
+        manifest['model_id'] = '\t'
+        manifest['model_config_identity'] = '\t'
     elif blank_state == 'empty_model_id':
         manifest['model_id'] = ''
     else:
@@ -988,10 +995,10 @@ def test_first_import_without_model_identity_is_not_certified(tmp_path, blank_st
         assert result['status'] == 'committed'
         assert result['validity_status'] == 'unverified'
         row = store.get_attempt('run-first-noid')
-        if blank_state in ('missing', 'none', 'empty', 'empty_model_id'):
-            assert not (row['model_id'] or '')
-        if blank_state in ('missing', 'none', 'empty', 'empty_config_identity'):
-            assert not (row['model_config_identity'] or '')
+        if blank_state in ('missing', 'none', 'empty', 'blank', 'tab', 'empty_model_id'):
+            assert not (row['model_id'] or '').strip()
+        if blank_state in ('missing', 'none', 'empty', 'blank', 'tab', 'empty_config_identity'):
+            assert not (row['model_config_identity'] or '').strip()
         assert 'import_identity_unverifiable' in row['status_reason']
         summary = render(store, tmp_path)
         assert 'run-first-noid' in summary.split('## Diagnostics')[1]

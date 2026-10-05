@@ -38,6 +38,15 @@ def is_secret_key(key: str) -> bool:
     return normalized in SECRET_KEY_NAMES or normalized.endswith(SECRET_KEY_SUFFIXES)
 
 
+def clean_identity(value):
+    """Normalize an identity value: missing, None, empty and blank all mean unknown."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
 

@@ -31,6 +31,7 @@ from .images import SWE_IMAGE_PREFIXES
 from .store import DuplicateAttemptError, Store
 from .util import (
     atomic_write_json,
+    clean_identity,
     collect_secrets,
     deep_merge,
     digest,
@@ -503,15 +504,6 @@ def _pretty_name(dataset: str):
         return None
 
 
-def _clean_identity(value):
-    """Normalize an identity value: missing, None, empty and blank all mean unknown."""
-    if value is None:
-        return None
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
-
-
 def _identity_conflicts(manifest: dict, existing, effective_manifest_identity=None) -> list:
     """Compare immutable run identity between the manifest and the DB row.
 
@@ -523,17 +515,17 @@ def _identity_conflicts(manifest: dict, existing, effective_manifest_identity=No
     """
     existing_keys = set(existing.keys()) if hasattr(existing, 'keys') else set()
     effective = {
-        'dataset': _clean_identity(manifest.get('dataset')),
-        'suite': _clean_identity(manifest.get('suite')),
-        'model_id': _clean_identity(manifest.get('model_id'))
-        or _clean_identity(manifest.get('report_id')),
-        'model_config_identity': _clean_identity(manifest.get('model_config_identity')),
-        'protocol_identity': _clean_identity(manifest.get('protocol_identity')),
-        'sample_manifest_identity': _clean_identity(effective_manifest_identity),
+        'dataset': clean_identity(manifest.get('dataset')),
+        'suite': clean_identity(manifest.get('suite')),
+        'model_id': clean_identity(manifest.get('model_id'))
+        or clean_identity(manifest.get('report_id')),
+        'model_config_identity': clean_identity(manifest.get('model_config_identity')),
+        'protocol_identity': clean_identity(manifest.get('protocol_identity')),
+        'sample_manifest_identity': clean_identity(effective_manifest_identity),
     }
     conflicts = []
     for field, new_value in effective.items():
-        old_value = _clean_identity(existing[field]) if field in existing_keys else None
+        old_value = clean_identity(existing[field]) if field in existing_keys else None
         if not old_value:
             continue
         if new_value is None:
@@ -581,7 +573,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             manifest.get('sample_manifest_detail') or {}
         )
         coverage_rows = apply_coverage(raw_rows, output_evidence)
-        declared_identity = manifest.get('sample_manifest_identity')
+        declared_identity = clean_identity(manifest.get('sample_manifest_identity'))
         computed_identity = digest(raw_rows) if raw_rows else None
         manifest_identity = declared_identity or computed_identity
         identity_inconsistent = bool(
@@ -596,7 +588,7 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
         # instead of a formal result.
         unverifiable = []
         for field in ('model_id', 'model_config_identity', 'protocol_identity'):
-            if not _clean_identity(manifest.get(field)):
+            if not clean_identity(manifest.get(field)):
                 unverifiable.append(f'{field}: <missing>')
         if manifest_identity is None:
             unverifiable.append('sample_manifest_identity: <missing>')
@@ -639,8 +631,8 @@ def import_output(output_dir: Path, store: Store, *, repo_dir: Path, data_root: 
             'sample_manifest_identity': manifest_identity,
             # Actual API model identity: persisted only when the artifact states
             # it; an earlier unverified import can be repaired by a later one.
-            'model_id': _clean_identity(manifest.get('model_id')),
-            'model_config_identity': _clean_identity(manifest.get('model_config_identity')),
+            'model_id': clean_identity(manifest.get('model_id')),
+            'model_config_identity': clean_identity(manifest.get('model_config_identity')),
         })
         safe_outcome = redact(outcome, secrets)
     except Exception as exc:  # noqa: BLE001 - parse failures are redacted at this boundary
@@ -781,9 +773,10 @@ def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: 
                              manifest_identity=None) -> dict:
     return {
         'run_id': manifest['attempt_id'], 'run_group': manifest.get('run_group'),
-        'model_alias': entry.model_alias, 'model_id': entry.model_cfg['model_id'],
+        'model_alias': entry.model_alias,
+        'model_id': clean_identity(entry.model_cfg['model_id']),
         'api_url': entry.model_cfg.get('api_url'),
-        'model_config_identity': manifest.get('model_config_identity'),
+        'model_config_identity': clean_identity(manifest.get('model_config_identity')),
         'suite': entry.suite, 'profile': entry.profile, 'dataset': entry.dataset,
         'execution_status': 'running', 'validity_status': None, 'status_reason': 'imported',
         'phase': 'imported', 'comparability': COMPARABILITY_UNKNOWN,
@@ -792,8 +785,9 @@ def _manifest_attempt_record(entry, manifest: dict, output_dir: Path, repo_dir: 
         'git_commit': git_commit(repo_dir), 'output_dir': str(output_dir),
         'config_json': json.dumps(redact(manifest.get('task_config') or {}), ensure_ascii=False,
                                   sort_keys=True),
-        'protocol_identity': manifest.get('protocol_identity'),
-        'sample_manifest_identity': manifest_identity or manifest.get('sample_manifest_identity'),
+        'protocol_identity': clean_identity(manifest.get('protocol_identity')),
+        'sample_manifest_identity': clean_identity(
+            manifest_identity or manifest.get('sample_manifest_identity')),
         'imported_at': now_iso(),
     }
 

@@ -7,6 +7,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from .util import clean_identity
+
 SCHEMA_VERSION = 3
 
 SCHEMA_V2 = """
@@ -285,15 +287,29 @@ class Store:
             self._write_outcome(record['run_id'], outcome)
 
     def _write_outcome(self, run_id: str, outcome: dict) -> None:
+        # Identity values are merged in Python with the same missing-value rule
+        # used by the import self-check (missing/None/empty/blank = unknown), so
+        # a stored "   " is treated exactly like NULL; a present value is never
+        # replaced.
+        current = self.conn.execute(
+            """SELECT model_id, model_config_identity, protocol_identity,
+                      sample_manifest_identity FROM runs WHERE run_id=?""",
+            (run_id,),
+        ).fetchone()
+
+        def merged(field):
+            stored = clean_identity(current[field]) if current is not None else None
+            return stored if stored is not None else clean_identity(outcome.get(field))
+
         self.conn.execute(
                 """UPDATE runs SET execution_status=?, validity_status=?, status_reason=?,
                        phase=?, comparability=?, finished_at=COALESCE(?, finished_at),
                        num_requested=?, num_succeeded=?,
                        num_errored=?, incomplete=?, report_path=?, diagnostics_json=?,
-                       perf_json=?, error=?, protocol_identity=COALESCE(NULLIF(protocol_identity, ''), ?),
-                       sample_manifest_identity=COALESCE(NULLIF(sample_manifest_identity, ''), ?),
-                       model_id=COALESCE(NULLIF(model_id, ''), ?),
-                       model_config_identity=COALESCE(NULLIF(model_config_identity, ''), ?),
+                       perf_json=?, error=?, protocol_identity=?,
+                       sample_manifest_identity=?,
+                       model_id=?,
+                       model_config_identity=?,
                        primary_metric_json=?, imported_at=COALESCE(?, imported_at)
                    WHERE run_id=?""",
                 (outcome.get('execution_status'), outcome.get('validity_status'),
@@ -303,8 +319,8 @@ class Store:
                  outcome.get('num_errored'), outcome.get('incomplete'),
                  outcome.get('report_path'), _dumps(outcome.get('diagnostics')),
                  _dumps(outcome.get('perf_metrics')), outcome.get('error'),
-                 outcome.get('protocol_identity'), outcome.get('sample_manifest_identity'),
-                 outcome.get('model_id'), outcome.get('model_config_identity'),
+                 merged('protocol_identity'), merged('sample_manifest_identity'),
+                 merged('model_id'), merged('model_config_identity'),
                  _dumps(outcome.get('primary_metric_identity')),
                  outcome.get('imported_at'),
                  run_id),

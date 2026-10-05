@@ -209,15 +209,17 @@ same artifact self-check runs on a **first** import, before any database row
 exists: a declared sample-manifest identity that disagrees with the manifest
 content is rejected, and an artifact whose model, model-config or protocol
 identity cannot be determined is stored as an `unverified` diagnostic row
-instead of being certified formal.  Missing, `NULL` and empty-string identity
-values are normalized to one internal "unknown" representation for the
-self-check, the comparison and the write; the model identity may be recovered
+instead of being certified formal.  Missing, `NULL`, empty-string and
+whitespace-only identity values are normalized to one internal "unknown"
+representation at import entry, during comparison and during the write; the
+model identity may be recovered
 from `report_id` (whose ownership was already validated) for conflict detection
 only; it is not persisted in place of the actual API model id.  A later
 complete import repairs an unverified row: `model_id` and
-`model_config_identity` are filled only when the stored value is `NULL` or an
-empty string, so a stored identity is never overwritten and the status can
-only become formal after the identity is actually persisted.  The rejection
+`model_config_identity` are filled only when the stored value is missing,
+`NULL`, empty or blank, so a stored identity is never overwritten and the
+status can only become formal after the identity is actually persisted.  The
+rejection
 result (`reason` and `conflicts`) and the audit file both go through the same
 redaction, so secrets in identity fields cannot reach stdout/stderr.  Moving
 the same output directory elsewhere still re-imports normally.
