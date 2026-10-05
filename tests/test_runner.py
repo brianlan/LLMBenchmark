@@ -996,9 +996,9 @@ def test_first_import_without_model_identity_is_not_certified(tmp_path, blank_st
         assert result['validity_status'] == 'unverified'
         row = store.get_attempt('run-first-noid')
         if blank_state in ('missing', 'none', 'empty', 'blank', 'tab', 'empty_model_id'):
-            assert not (row['model_id'] or '').strip()
+            assert row['model_id'] is None
         if blank_state in ('missing', 'none', 'empty', 'blank', 'tab', 'empty_config_identity'):
-            assert not (row['model_config_identity'] or '').strip()
+            assert row['model_config_identity'] is None
         assert 'import_identity_unverifiable' in row['status_reason']
         summary = render(store, tmp_path)
         assert 'run-first-noid' in summary.split('## Diagnostics')[1]
