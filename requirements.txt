@@ -1,0 +1,3 @@
+# Core: enough to build a plan, inspect status and render summaries/reports.
+# Running benchmarks additionally needs the extras below.
+PyYAML>=6.0.1

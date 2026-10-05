@@ -1,0 +1,14 @@
+# Everything needed to actually execute benchmark runs.
+-r requirements.txt
+
+# EvalScope plus the extras for the suites in configs/suites.yaml:
+#   ifeval        -> IFEval instructions
+#   ocr-bench     -> OCRBench-v2 / DocVQA
+#   swe-bench     -> SWE-bench Verified (oracle + agentic)
+#   sandbox       -> sandboxed code execution for LiveCodeBench etc.
+#   service       -> local scoring/tokenizer service used by some benchmarks
+evalscope[ifeval,ocr-bench,swe-bench,sandbox,service]==1.12.0
+
+# OCRBench-v2 scorer calls nltk.edit_distance, which refuses inputs > 2000
+# chars on nltk >= 3.9; llmbench scopes a patch to Levenshtein (see llmbench/compat.py).
+python-Levenshtein>=0.25.1

@@ -1,0 +1,4 @@
+# Offline unit/integration tests only: no EvalScope, no Docker, no API calls.
+-r requirements.txt
+
+pytest>=8.0
