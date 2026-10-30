@@ -4,7 +4,19 @@
 # that holds the key.  Add one entry per model to compare on the same suites.
 
 models:
-  minimax:
+  step-5-preview:
+    model_id: step-5-preview
+    api_url: https://api.stepfun.com/step_plan/v1
+    api_key_env: STEPFUN_API_KEY
+    eval_type: openai_api
+    deployment_version: unknown
+    generation_config:
+      max_tokens: 32768
+      temperature: 0.0
+      timeout: 600
+      retries: 3
+      retry_interval: 10
+  minimax-m3.1-flash-preview:
     model_id: MiniMax-M3.1-Flash-Preview
     api_url: https://api.minimax.cn/v1
     api_key_env: MINIMAX_API_KEY
